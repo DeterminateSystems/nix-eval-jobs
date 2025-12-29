@@ -402,6 +402,11 @@ auto processWorkerResponse(LineReader *fromReader,
         if (!hasPendingConstituents) {
             getCoutLock().lock() << respString << "\n";
         }
+
+        if (auto *error = std::get_if<Response::Error>(&response.payload);
+            (error != nullptr) && error->fatal) {
+            throw nix::Error("%s", error->error);
+        }
     }
 
     return newAttrs;
@@ -526,7 +531,7 @@ auto main(int argc, char **argv) -> int {
 
         /* FIXME: The build hook in conjunction with import-from-derivation is
          * causing "unexpected EOF" during eval */
-        nix::settings.builders = "";
+        nix::settings.getWorkerSettings().builders = "";
 
         /* Set no-instantiate mode if requested (makes evaluation faster) */
         if (myArgs.noInstantiate) {

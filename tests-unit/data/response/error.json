@@ -3,5 +3,6 @@
   "attrPath": [
     "broken"
   ],
-  "error": "evaluation failed"
+  "error": "evaluation failed",
+  "fatal": false
 }

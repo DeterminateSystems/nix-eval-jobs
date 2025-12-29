@@ -3,6 +3,7 @@
 
 #include <nix/util/tests/characterization.hh>
 #include <nix/util/tests/json-characterization.hh>
+#include <nix/util/tests/test-data.hh>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <string_view>

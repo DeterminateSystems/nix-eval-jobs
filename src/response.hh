@@ -38,6 +38,9 @@ struct Response {
 
     struct Error {
         std::string error;
+        /// If true the collector should abort (e.g. for back compat we
+        /// set this true for stack overflow errors).
+        bool fatal = false;
         bool operator==(const Error &) const = default;
     };
 

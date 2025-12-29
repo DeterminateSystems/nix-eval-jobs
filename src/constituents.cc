@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <fnmatch.h>
 #include <cassert>
 #include <sstream>
@@ -125,7 +126,7 @@ void addConstituents(nlohmann::json &job, nix::Derivation &drv,
 auto rewriteDerivation(nlohmann::json &job, nix::Derivation &drv,
                        const nix::StorePath &drvPath,
                        const nix::ref<nix::LocalFSStore> &store,
-                       const nix::Path &gcRootsDir) -> bool {
+                       const std::filesystem::path &gcRootsDir) -> bool {
     std::string drvName(drvPath.name());
     assert(nix::hasSuffix(drvName, nix::drvExtension));
     drvName.resize(drvName.size() - nix::drvExtension.size());
@@ -143,12 +144,12 @@ auto rewriteDerivation(nlohmann::json &job, nix::Derivation &drv,
     drv.outputs.insert_or_assign(
         "out", nix::DerivationOutput::InputAddressed{.path = outPath});
 
-    auto newDrvPath = nix::writeDerivation(*store, drv);
+    auto newDrvPath = store->writeDerivation(drv);
     auto newDrvPathS = store->printStorePath(newDrvPath);
 
     if (!gcRootsDir.empty()) {
-        const nix::Path root =
-            gcRootsDir + "/" + std::string(nix::baseNameOf(newDrvPathS));
+        const auto root =
+            gcRootsDir / std::string(nix::baseNameOf(newDrvPathS));
 
         if (!nix::pathExists(root)) {
             store->addPermRoot(newDrvPath, root);
@@ -240,7 +241,7 @@ auto resolveNamedConstituents(const std::map<std::string, nlohmann::json> &jobs)
 void rewriteAggregates(std::map<std::string, nlohmann::json> &jobs,
                        const std::vector<AggregateJob> &aggregateJobs,
                        const nix::ref<nix::LocalFSStore> &store,
-                       const nix::Path &gcRootsDir) {
+                       const std::filesystem::path &gcRootsDir) {
     for (const auto &aggregateJob : aggregateJobs) {
         auto &job = jobs.find(aggregateJob.name)->second;
         auto drvPath = store->parseStorePath(std::string(job["drvPath"]));

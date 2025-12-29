@@ -15,6 +15,7 @@
 namespace nlohmann {
 
 using nix::get;
+using nix::getBoolean;
 using nix::getObject;
 using nix::getString;
 using nix::overloaded;
@@ -39,6 +40,7 @@ void adl_serializer<Response>::to_json(json &res, const Response &response) {
                    },
                    [&](const Response::Error &error) -> void {
                        res["error"] = error.error;
+                       res["fatal"] = error.fatal;
                    },
                },
                response.payload);
@@ -62,7 +64,11 @@ auto adl_serializer<Response>::from_json(const json &_json) -> Response {
         return makeResponse(Response::Attrs{*attrs});
     }
     if (const auto *error = get(json, "error")) {
-        return makeResponse(Response::Error{getString(*error)});
+        Response::Error err{.error = getString(*error)};
+        if (const auto *fatalJson = get(json, "fatal")) {
+            err.fatal = getBoolean(*fatalJson);
+        }
+        return makeResponse(std::move(err));
     }
     if (get(json, "drvPath") != nullptr) {
         auto drv = adl_serializer<Drv>::from_json(_json);

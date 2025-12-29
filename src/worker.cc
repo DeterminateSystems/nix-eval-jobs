@@ -216,8 +216,8 @@ auto registerGCRoot(nix::EvalState &state, const Drv &drv, const MyArgs &args)
         return;
     }
 
-    const nix::Path root =
-        args.gcRootsDir + "/" + std::string(drv.drvPath.to_string());
+    const std::filesystem::path root =
+        args.gcRootsDir / std::string(drv.drvPath.to_string());
 
     if (!nix::pathExists(root)) {
         auto localStore = state.store.dynamic_pointer_cast<nix::LocalFSStore>();
@@ -367,7 +367,16 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
             // macOS (?)
             const auto *msg = e.what();
             std::cerr << msg << '\n';
-            return Response::Error{nix::filterANSIEscapes(msg, true)};
+            return Response::Error{
+                .error = nix::filterANSIEscapes(msg, true),
+                // Nix 2.34 throws `StackOverflowError` whreas before, Nix
+                // actually exhausted the C/C++ stack and crashed the worker.
+                //
+                // Mark this error fatal so the collector replicates the old
+                // fail-on-infinite-recursion behavior.
+                .fatal = dynamic_cast<const nix::StackOverflowError *>(&e) !=
+                         nullptr,
+            };
         }
     }();
 
