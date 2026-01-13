@@ -23,17 +23,17 @@
     "nix": {
       "flake": false,
       "locked": {
-        "lastModified": 1766964416,
-        "narHash": "sha256-t8RPyN8tB9dDuvunvDpTy4MapJs6phsI4WGch5ztfX4=",
-        "owner": "NixOS",
-        "repo": "nix",
-        "rev": "4c6a9cf2f7ad9ecc09195423b4d8c1c533ef7654",
+        "lastModified": 1768238652,
+        "narHash": "sha256-t04q3zN6mRumrkqkRAEmqORMU7WOkzvflV9kzfbggA0=",
+        "owner": "DeterminateSystems",
+        "repo": "nix-src",
+        "rev": "e66eb48465ce5f7476b782d767881e604f76025c",
         "type": "github"
       },
       "original": {
-        "owner": "NixOS",
-        "ref": "2.33-maintenance",
-        "repo": "nix",
+        "owner": "DeterminateSystems",
+        "ref": "main",
+        "repo": "nix-src",
         "type": "github"
       }
     },

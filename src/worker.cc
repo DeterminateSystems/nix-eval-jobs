@@ -154,6 +154,8 @@ auto extractConstituents(nix::EvalState &state, nix::Value *value,
                         [[maybe_unused]]) -> void {},
                     [&](const nix::NixStringContextElem::DrvDeep &drvDeep
                         [[maybe_unused]]) -> void {},
+                    [&](const nix::NixStringContextElem::Path &_
+                        [[maybe_unused]]) -> void {},
                 },
                 ctx.raw);
         }
