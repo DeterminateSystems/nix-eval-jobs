@@ -26,3 +26,12 @@ jobs:
           "aarch64-linux": "UbuntuLatest32Cores128GArm",
           "x86_64-linux": "UbuntuLatest32Cores128G"
         }
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - DeterminateCI
+    if: github.event_name == 'release' && github.event.action == 'published'
+    steps:
+      # spaghetti demands a release workflow happen
+      - run: true
