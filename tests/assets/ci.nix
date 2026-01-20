@@ -1,37 +1,25 @@
-{
-  system ? "x86_64-linux",
-}:
+{ system ? "x86_64-linux", }:
 
 let
   dep-a = derivation {
     name = "dep-a";
     inherit system;
     builder = "/bin/sh";
-    args = [
-      "-c"
-      "echo 'bbbbbb' > $out"
-    ];
+    args = [ "-c" "echo 'bbbbbb' > $out" ];
   };
 
   dep-b = derivation {
     name = "dep-b";
     inherit system;
     builder = "/bin/sh";
-    args = [
-      "-c"
-      "echo 'aaaaaa' > $out"
-    ];
+    args = [ "-c" "echo 'aaaaaa' > $out" ];
   };
-in
-{
+in {
   builtJob = derivation {
     name = "job1";
     inherit system;
     builder = "/bin/sh";
-    args = [
-      "-c"
-      "echo 'job1' > $out"
-    ];
+    args = [ "-c" "echo 'job1' > $out" ];
     requiredSystemFeatures = [ "big-parallel" ];
   };
 
@@ -51,20 +39,14 @@ in
     name = "dotted";
     inherit system;
     builder = "/bin/sh";
-    args = [
-      "-c"
-      "echo 'dotted' > $out"
-    ];
+    args = [ "-c" "echo 'dotted' > $out" ];
   };
 
   package-with-deps = derivation {
     name = "package-with-deps";
     inherit system;
     builder = "/bin/sh";
-    args = [
-      "-c"
-      "echo '${dep-a} ${dep-b}' > $out"
-    ];
+    args = [ "-c" "echo '${dep-a} ${dep-b}' > $out" ];
   };
 
   recurse = {

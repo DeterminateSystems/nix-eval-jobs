@@ -1,10 +1,8 @@
 { pkgs, lib, ... }:
 let
-  supportsDeno =
-    lib.meta.availableOn pkgs.stdenv.buildPlatform pkgs.deno
+  supportsDeno = lib.meta.availableOn pkgs.stdenv.buildPlatform pkgs.deno
     && (builtins.tryEval pkgs.deno.outPath).success;
-in
-{
+in {
   flakeCheck = pkgs.stdenv.hostPlatform.system != "riscv64-linux";
   # Used to find the project root
   projectRootFile = "flake.lock";
@@ -12,9 +10,7 @@ in
   programs.deno.enable = supportsDeno;
   programs.yamlfmt = {
     enable = true;
-    settings.formatter = {
-      retain_line_breaks = true;
-    };
+    settings.formatter = { retain_line_breaks = true; };
   };
 
   programs.clang-format.enable = true;
@@ -25,9 +21,7 @@ in
   programs.mypy = {
     enable = true;
     directories = {
-      "tests" = {
-        extraPythonPackages = [ pkgs.python3Packages.pytest ];
-      };
+      "tests" = { extraPythonPackages = [ pkgs.python3Packages.pytest ]; };
     };
   };
   programs.ruff.format = true;
