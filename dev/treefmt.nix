@@ -10,7 +10,12 @@ in
   projectRootFile = "flake.lock";
 
   programs.deno.enable = supportsDeno;
-  programs.yamlfmt.enable = true;
+  programs.yamlfmt = {
+    enable = true;
+    settings.formatter = {
+      retain_line_breaks = true;
+    };
+  };
 
   programs.clang-format.enable = true;
   programs.clang-format.package = pkgs.llvmPackages_latest.clang-tools;
