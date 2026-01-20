@@ -1,22 +1,16 @@
 {
-  outputs =
-    { self, ... }:
+  outputs = { self, ... }:
     let
       system = "x86_64-linux";
 
       # Simple replacement for writeText
-      makeTextDrv =
-        name: text:
+      makeTextDrv = name: text:
         derivation {
           inherit name system;
           builder = "/bin/sh";
-          args = [
-            "-c"
-            "echo '${text}' > $out"
-          ];
+          args = [ "-c" "echo '${text}' > $out" ];
         };
-    in
-    {
+    in {
       hydraJobs = import ./ci.nix { inherit system; };
 
       legacyPackages.x86_64-linux = {
@@ -27,85 +21,55 @@
             name = "nginx-1.24.0";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo 'content' > $out"
-            ];
+            args = [ "-c" "echo 'content' > $out" ];
           };
           proxyWrapper = derivation {
             name = "proxyWrapper";
             system = "aarch64-linux";
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo '${nginx}' > $out"
-            ];
+            args = [ "-c" "echo '${nginx}' > $out" ];
           };
           webService = derivation {
             name = "webService";
             system = "aarch64-linux";
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo '${proxyWrapper}' > $out"
-            ];
+            args = [ "-c" "echo '${proxyWrapper}' > $out" ];
           };
         };
-        brokenPkgs = {
-          brokenPackage = throw "this is an evaluation error";
-        };
+        brokenPkgs = { brokenPackage = throw "this is an evaluation error"; };
         infiniteRecursionPkgs = {
-          packageWithInfiniteRecursion =
-            let
-              recursion = [ recursion ];
-            in
-            derivation {
-              inherit system;
-              name = "drvB";
-              recursiveAttr = recursion;
-              builder = ":";
-            };
+          packageWithInfiniteRecursion = let recursion = [ recursion ];
+          in derivation {
+            inherit system;
+            name = "drvB";
+            recursiveAttr = recursion;
+            builder = ":";
+          };
         };
         success = {
           indirect_aggregate = derivation {
             name = "indirect_aggregate";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              "anotherone"
-            ];
+            constituents = [ "anotherone" ];
           };
           direct_aggregate = derivation {
             name = "direct_aggregate";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              self.hydraJobs.builtJob
-            ];
+            constituents = [ self.hydraJobs.builtJob ];
           };
           mixed_aggregate = derivation {
             name = "mixed_aggregate";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              self.hydraJobs.builtJob
-              "anotherone"
-            ];
+            constituents = [ self.hydraJobs.builtJob "anotherone" ];
           };
           anotherone = makeTextDrv "constituent" "text";
         };
@@ -114,15 +78,9 @@
             name = "aggregate";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              "doesntexist"
-              "doesnteval"
-            ];
+            constituents = [ "doesntexist" "doesnteval" ];
           };
           doesnteval = makeTextDrv "constituent" (toString { });
         };
@@ -131,28 +89,19 @@
             name = "constituentA";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
           };
           constituentB = derivation {
             name = "constituentB";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
           };
           aggregate = derivation {
             name = "aggregate";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
             _hydraGlobConstituents = true;
             constituents = [ "*" ];
@@ -163,10 +112,7 @@
             name = "aggregate0";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
             _hydraGlobConstituents = true;
             constituents = [ "aggregate1" ];
@@ -175,10 +121,7 @@
             name = "aggregate1";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
             _hydraGlobConstituents = true;
             constituents = [ "aggregate0" ];
@@ -191,75 +134,48 @@
               name = "constituentA";
               inherit system;
               builder = "/bin/sh";
-              args = [
-                "-c"
-                "echo done > $out"
-              ];
+              args = [ "-c" "echo done > $out" ];
             };
             constituentB = derivation {
               name = "constituentB";
               inherit system;
               builder = "/bin/sh";
-              args = [
-                "-c"
-                "echo done > $out"
-              ];
+              args = [ "-c" "echo done > $out" ];
             };
           };
           aggregate0 = derivation {
             name = "aggregate0";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
             _hydraGlobConstituents = true;
-            constituents = [
-              "packages.*"
-            ];
+            constituents = [ "packages.*" ];
           };
           aggregate1 = derivation {
             name = "aggregate1";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
             _hydraGlobConstituents = true;
-            constituents = [
-              "tests.*"
-            ];
+            constituents = [ "tests.*" ];
           };
           indirect_aggregate0 = derivation {
             name = "indirect_aggregate0";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              "aggregate0"
-            ];
+            constituents = [ "aggregate0" ];
           };
           mix_aggregate0 = derivation {
             name = "mix_aggregate0";
             inherit system;
             builder = "/bin/sh";
-            args = [
-              "-c"
-              "echo done > $out"
-            ];
+            args = [ "-c" "echo done > $out" ];
             _hydraAggregate = true;
-            constituents = [
-              "aggregate0"
-              packages.constituentA
-            ];
+            constituents = [ "aggregate0" packages.constituentA ];
           };
         };
       };
