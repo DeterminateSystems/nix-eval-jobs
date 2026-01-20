@@ -21,6 +21,7 @@
 #include <nix/util/json-utils.hh> //NOLINT(misc-include-cleaner)
 #include <nix/util/pos-idx.hh>
 #include <nix/util/util.hh> // for get()
+#include <nix/store/async-path-writer.hh>
 #include <exception>
 #include <map>
 #include <optional>
@@ -203,6 +204,7 @@ Drv::Drv(std::string &attrPath, nix::EvalState &state,
 
     if (canReadDerivation) {
         // We can read the derivation directly for precise information
+        state.asyncPathWriter->waitForPath(packageInfo.requireDrvPath());
         auto drv = localStore->readDerivation(packageInfo.requireDrvPath());
 
         // Use the more precise system from the derivation
