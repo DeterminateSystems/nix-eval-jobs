@@ -1,12 +1,9 @@
 {
   description = "Hydra's builtin hydra-eval-jobs as a standalone";
 
-  inputs.nixpkgs.url = "https://nixos.org/channels/nixpkgs-unstable/nixexprs.tar.xz";
-  inputs.nix = {
-    url = "github:DeterminateSystems/nix-src/main";
-    # We want to control the deps precisely
-    flake = false;
-  };
+  inputs.nix.url = "https://flakehub.com/f/DeterminateSystems/nix-src/3";
+  inputs.nixpkgs.follows = "nix/nixpkgs";
+
   inputs.flake-parts.url = "github:hercules-ci/flake-parts";
   inputs.flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
   inputs.treefmt-nix.url = "github:numtide/treefmt-nix";
@@ -20,11 +17,8 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "aarch64-linux"
-        "riscv64-linux"
         "x86_64-linux"
-
         "aarch64-darwin"
-        "x86_64-darwin"
       ];
       imports = [ inputs.treefmt-nix.flakeModule ];
 
