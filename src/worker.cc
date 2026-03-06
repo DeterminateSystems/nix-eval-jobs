@@ -83,9 +83,9 @@ auto evaluateFlake(const nix::ref<nix::EvalState> &state,
             nix::fetchSettings, releaseExpr,
             nix::absPath(std::filesystem::path(".")));
 
-    nix::InstallableFlake flake{{},       state,      std::move(flakeRef),
-                                fragment, outputSpec, {},
-                                {},       lockFlags};
+    nix::InstallableFlake flake{{},        state,      std::move(flakeRef),
+                                fragment,  outputSpec, {},
+                                lockFlags, {}};
 
     // If no fragment specified, use callFlake to get the full flake structure
     // (just like :lf in the REPL)
