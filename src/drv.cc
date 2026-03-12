@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <nix/store/path.hh>
+#include <nix/store/store-dir-config.hh>
 #include <nix/util/ref.hh>
 #include <nix/expr/value/context.hh>
 #include <nix/util/error.hh>
@@ -38,8 +39,8 @@ namespace {
 
 auto queryOutputs(nix::PackageInfo &packageInfo, nix::EvalState &state,
                   const std::string &attrPath)
-    -> std::map<std::string, std::optional<std::string>> {
-    std::map<std::string, std::optional<std::string>> outputs;
+    -> std::map<std::string, std::optional<nix::StorePath>> {
+    std::map<std::string, std::optional<nix::StorePath>> outputs;
 
     try {
         nix::PackageInfo::Outputs outputsQueried;
@@ -57,12 +58,7 @@ auto queryOutputs(nix::PackageInfo &packageInfo, nix::EvalState &state,
             outputsQueried = packageInfo.queryOutputs(false);
         }
         for (auto &[outputName, optOutputPath] : outputsQueried) {
-            if (optOutputPath) {
-                outputs[outputName] =
-                    state.store->printStorePath(*optOutputPath);
-            } else {
-                outputs[outputName] = std::nullopt;
-            }
+            outputs[outputName] = optOutputPath;
         }
     } catch (const std::exception &e) {
         state
@@ -96,32 +92,32 @@ auto queryMeta(nix::PackageInfo &packageInfo, nix::EvalState &state)
     return meta_;
 }
 
-auto queryInputDrvs(const nix::Derivation &drv, nix::Store &store)
-    -> std::map<std::string, std::set<std::string>> {
-    std::map<std::string, std::set<std::string>> drvs;
+auto queryInputDrvs(const nix::Derivation &drv)
+    -> std::map<nix::StorePath, std::set<std::string>> {
+    std::map<nix::StorePath, std::set<std::string>> drvs;
     for (const auto &[inputDrvPath, inputNode] : drv.inputDrvs.map) {
         std::set<std::string> inputDrvOutputs;
         for (const auto &outputName : inputNode.value) {
             inputDrvOutputs.insert(outputName);
         }
-        drvs[store.printStorePath(inputDrvPath)] = inputDrvOutputs;
+        drvs.emplace(inputDrvPath, std::move(inputDrvOutputs));
     }
     return drvs;
 }
 
 auto queryCacheStatus(
     nix::Store &store,
-    std::map<std::string, std::optional<std::string>> &outputs,
-    std::vector<std::string> &neededBuilds,
-    std::vector<std::string> &neededSubstitutes,
-    std::vector<std::string> &unknownPaths, const nix::Derivation &drv)
+    std::map<std::string, std::optional<nix::StorePath>> &outputs,
+    nix::StorePaths &neededBuilds,
+    std::vector<nix::StorePath> &neededSubstitutes,
+    std::vector<nix::StorePath> &unknownPaths, const nix::Derivation &drv)
     -> Drv::CacheStatus {
 
     std::vector<nix::StorePathWithOutputs> paths;
     // Add output paths
     for (auto const &[key, val] : outputs) {
         if (val) {
-            paths.push_back(followLinksToStorePathWithOutputs(store, *val));
+            paths.push_back(nix::StorePathWithOutputs{*val, {}});
         }
     }
 
@@ -138,7 +134,7 @@ auto queryCacheStatus(
         auto sorted = store.topoSortPaths(missing.willBuild);
         std::ranges::reverse(sorted.begin(), sorted.end());
         for (auto &path : sorted) {
-            neededBuilds.push_back(store.printStorePath(path));
+            neededBuilds.push_back(std::move(path));
         }
     }
     if (!missing.willSubstitute.empty()) {
@@ -157,13 +153,13 @@ auto queryCacheStatus(
                 return lhs->name() < rhs->name();
             });
         for (const auto *path : willSubstituteSorted) {
-            neededSubstitutes.push_back(store.printStorePath(*path));
+            neededSubstitutes.push_back(*path);
         }
     }
 
     if (!missing.unknown.empty()) {
         for (const auto &path : missing.unknown) {
-            unknownPaths.push_back(store.printStorePath(path));
+            unknownPaths.push_back(path);
         }
     }
 
@@ -185,16 +181,22 @@ auto queryCacheStatus(
 } // namespace
 
 /* The fields of a derivation that are printed in json form */
-Drv::Drv(std::string &attrPath, nix::EvalState &state,
-         nix::PackageInfo &packageInfo, MyArgs &args,
-         std::optional<Constituents> constituents)
-    : name(packageInfo.queryName()),
-      outputs(queryOutputs(packageInfo, state, attrPath)),
-      constituents(std::move(constituents)) {
-
+auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
+                          nix::PackageInfo &packageInfo, MyArgs &args,
+                          Constituents constituents) -> Drv {
     auto store = state.store;
 
-    drvPath = store->printStorePath(packageInfo.requireDrvPath());
+    Drv result{
+        .name = packageInfo.queryName(),
+        .storeDir = store->storeDir,
+        .system = {},
+        .drvPath = packageInfo.requireDrvPath(),
+        .outputs = queryOutputs(packageInfo, state, attrPath),
+        .neededBuilds = {},
+        .neededSubstitutes = {},
+        .unknownPaths = {},
+        .constituents = std::move(constituents),
+    };
 
     // Check if we can read derivations (requires LocalFSStore and not in
     // read-only mode)
@@ -206,83 +208,210 @@ Drv::Drv(std::string &attrPath, nix::EvalState &state,
         auto drv = localStore->readDerivation(packageInfo.requireDrvPath());
 
         // Use the more precise system from the derivation
-        system = drv.platform;
+        result.system = drv.platform;
 
         if (args.checkCacheStatus) {
             // TODO: is this a bottleneck, where we should batch these queries?
-            cacheStatus =
-                queryCacheStatus(*store, outputs, neededBuilds,
-                                 neededSubstitutes, unknownPaths, drv);
-        } else {
-            cacheStatus = Drv::CacheStatus::Unknown;
+            result.cacheStatus = queryCacheStatus(
+                *store, result.outputs, result.neededBuilds,
+                result.neededSubstitutes, result.unknownPaths, drv);
         }
 
         if (args.showInputDrvs) {
-            inputDrvs = queryInputDrvs(drv, *store);
+            result.inputDrvs = queryInputDrvs(drv);
         }
 
         auto drvOptions = derivationOptionsFromStructuredAttrs(
             *store, drv.env, get(drv.structuredAttrs));
-        requiredSystemFeatures =
+        result.requiredSystemFeatures =
             std::optional(drvOptions.getRequiredSystemFeatures(drv));
     } else {
         // Fall back to basic info from PackageInfo
         // This happens when:
         // - In read-only/no-instantiate mode
         // - Store is not a LocalFSStore (e.g., remote store)
-        system = packageInfo.querySystem();
-        cacheStatus = Drv::CacheStatus::Unknown;
-        // Can't get input derivations without reading the .drv file
+        result.system = packageInfo.querySystem();
     }
 
     // Handle metadata (works in both modes)
     if (args.meta) {
-        meta = queryMeta(packageInfo, state);
+        result.meta = queryMeta(packageInfo, state);
     }
+
+    return result;
 }
 
-void to_json(nlohmann::json &json, const Drv &drv) {
-    json = nlohmann::json{{"name", drv.name},
-                          {"system", drv.system},
-                          {"drvPath", drv.drvPath},
-                          {"outputs", drv.outputs}};
+namespace nlohmann {
+
+using nix::get;
+using nix::getBoolean;
+using nix::getObject;
+using nix::getString;
+using nix::valueAt;
+
+void adl_serializer<Constituents>::to_json(json &res, const Constituents &val) {
+    res = json{
+        {"constituents", val.constituents},
+        {"namedConstituents", val.namedConstituents},
+        {"globConstituents", val.globConstituents},
+    };
+}
+
+auto adl_serializer<Constituents>::from_json(const json &_json)
+    -> Constituents {
+    const auto &json = getObject(_json);
+
+    Constituents result;
+    if (const auto *constituents = get(json, "constituents")) {
+        result.constituents = *constituents;
+    }
+    if (const auto *named = get(json, "namedConstituents")) {
+        result.namedConstituents = *named;
+    }
+    if (const auto *glob = get(json, "globConstituents")) {
+        result.globConstituents = getBoolean(*glob);
+    }
+    return result;
+}
+
+void adl_serializer<Drv>::to_json(json &res, const Drv &drv) {
+    nix::StoreDirConfig const storeDirConfig{drv.storeDir};
+
+    json outputs;
+    for (const auto &[name, optPath] : drv.outputs) {
+        if (optPath) {
+            outputs[name] = storeDirConfig.printStorePath(*optPath);
+        } else {
+            outputs[name] = nullptr;
+        }
+    }
+
+    res = json{
+        {"name", drv.name},
+        {"storeDir", drv.storeDir},
+        {"system", drv.system},
+        {"drvPath", storeDirConfig.printStorePath(drv.drvPath)},
+        {"outputs", std::move(outputs)},
+    };
 
     if (drv.meta.has_value()) {
-        json["meta"] = drv.meta.value();
+        res["meta"] = drv.meta.value();
     }
     if (drv.inputDrvs) {
-        json["inputDrvs"] = drv.inputDrvs.value();
+        json inputDrvs = json::object();
+        for (const auto &[path, outputNames] : *drv.inputDrvs) {
+            inputDrvs[storeDirConfig.printStorePath(path)] = outputNames;
+        }
+        res["inputDrvs"] = std::move(inputDrvs);
     }
 
     if (drv.requiredSystemFeatures) {
-        json["requiredSystemFeatures"] = drv.requiredSystemFeatures.value();
+        res["requiredSystemFeatures"] = drv.requiredSystemFeatures.value();
     }
 
-    if (auto constituents = drv.constituents) {
-        json["constituents"] = constituents->constituents;
-        json["namedConstituents"] = constituents->namedConstituents;
-        json["globConstituents"] = constituents->globConstituents;
-    }
+    res.update(json(drv.constituents));
 
     if (drv.cacheStatus != Drv::CacheStatus::Unknown) {
         // Deprecated field
-        json["isCached"] = drv.cacheStatus == Drv::CacheStatus::Cached ||
-                           drv.cacheStatus == Drv::CacheStatus::Local;
+        res["isCached"] = drv.cacheStatus == Drv::CacheStatus::Cached ||
+                          drv.cacheStatus == Drv::CacheStatus::Local;
 
         switch (drv.cacheStatus) {
         case Drv::CacheStatus::Cached:
-            json["cacheStatus"] = "cached";
+            res["cacheStatus"] = "cached";
             break;
         case Drv::CacheStatus::Local:
-            json["cacheStatus"] = "local";
+            res["cacheStatus"] = "local";
             break;
         default:
-            json["cacheStatus"] = "notBuilt";
+            res["cacheStatus"] = "notBuilt";
             break;
         }
-        json["neededBuilds"] = drv.neededBuilds;
-        json["neededSubstitutes"] = drv.neededSubstitutes;
+        res["neededBuilds"] = json::array();
+        for (const auto &path : drv.neededBuilds) {
+            res["neededBuilds"].push_back(storeDirConfig.printStorePath(path));
+        }
+        res["neededSubstitutes"] = json::array();
+        for (const auto &path : drv.neededSubstitutes) {
+            res["neededSubstitutes"].push_back(
+                storeDirConfig.printStorePath(path));
+        }
         // TODO: is it useful to include "unknown" paths at all?
-        // json["unknown"] = drv.unknownPaths;
+        // res["unknown"] = drv.unknownPaths;
     }
 }
+
+auto adl_serializer<Drv>::from_json(const json &_json) -> Drv {
+    const auto &json = getObject(_json);
+
+    auto storeDir = getString(valueAt(json, "storeDir"));
+    nix::StoreDirConfig const storeDirConfig{storeDir};
+
+    std::map<std::string, std::optional<nix::StorePath>> outputs;
+    for (const auto &[name, val] : getObject(valueAt(json, "outputs"))) {
+        if (val.is_null()) {
+            outputs.emplace(name, std::nullopt);
+        } else {
+            outputs.emplace(name,
+                            storeDirConfig.parseStorePath(getString(val)));
+        }
+    }
+
+    Drv drv{
+        .name = getString(valueAt(json, "name")),
+        .storeDir = storeDir,
+        .system = getString(valueAt(json, "system")),
+        .drvPath =
+            storeDirConfig.parseStorePath(getString(valueAt(json, "drvPath"))),
+        .outputs = std::move(outputs),
+        .neededBuilds = {},
+        .neededSubstitutes = {},
+        .unknownPaths = {},
+        .constituents = {},
+    };
+
+    if (const auto *meta = get(json, "meta")) {
+        drv.meta = *meta;
+    }
+    if (const auto *inputDrvsJson = get(json, "inputDrvs")) {
+        std::map<nix::StorePath, std::set<std::string>> inputDrvs;
+        for (const auto &[pathStr, outputNames] : getObject(*inputDrvsJson)) {
+            inputDrvs.emplace(storeDirConfig.parseStorePath(pathStr),
+                              outputNames.get<std::set<std::string>>());
+        }
+        drv.inputDrvs = std::move(inputDrvs);
+    }
+    if (const auto *rsf = get(json, "requiredSystemFeatures")) {
+        drv.requiredSystemFeatures = *rsf;
+    }
+
+    drv.constituents = adl_serializer<Constituents>::from_json(_json);
+
+    if (const auto *cacheStatus = get(json, "cacheStatus")) {
+        auto status = getString(*cacheStatus);
+        if (status == "cached") {
+            drv.cacheStatus = Drv::CacheStatus::Cached;
+        } else if (status == "local") {
+            drv.cacheStatus = Drv::CacheStatus::Local;
+        } else {
+            drv.cacheStatus = Drv::CacheStatus::NotBuilt;
+        }
+
+        if (const auto *neededBuilds = get(json, "neededBuilds")) {
+            for (const auto &path : *neededBuilds) {
+                drv.neededBuilds.push_back(
+                    storeDirConfig.parseStorePath(getString(path)));
+            }
+        }
+        if (const auto *neededSubstitutes = get(json, "neededSubstitutes")) {
+            for (const auto &path : *neededSubstitutes) {
+                drv.neededSubstitutes.push_back(
+                    storeDirConfig.parseStorePath(getString(path)));
+            }
+        }
+    }
+
+    return drv;
+}
+
+} // namespace nlohmann

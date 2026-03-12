@@ -62,12 +62,12 @@
 
           checks = builtins.removeAttrs self'.packages [ "default" ] // {
             shell = self'.devShells.default;
-            tests =
-              pkgs.runCommand "nix-eval-jobs-tests"
+            functional-tests =
+              pkgs.runCommand "nix-eval-jobs-functional-tests"
                 {
                   src = lib.fileset.toSource {
                     fileset = lib.fileset.unions [
-                      ./tests
+                      ./tests-functional
                     ];
                     root = ./.;
                   };
@@ -79,7 +79,7 @@
                 }
                 ''
                   # Copy test files
-                  cp -r $src/tests .
+                  cp -r $src/tests-functional .
 
                   # Set up test environment
                   export HOME=$TMPDIR
@@ -93,12 +93,13 @@
                   export NIX_EVAL_JOBS_BIN=${self'.packages.nix-eval-jobs}/bin/nix-eval-jobs
 
                   # Run the tests
-                  pytest tests/ -v
+                  pytest tests-functional/ -v
 
                   # Create output marker
                   touch $out
                 '';
             clang-tidy-fix = self'.packages.nix-eval-jobs.overrideAttrs (old: {
+              pname = "nix-eval-jobs-clang-tidy";
               nativeBuildInputs = old.nativeBuildInputs ++ [
                 pkgs.git
                 (lib.hiPrio pkgs.llvmPackages.clang-tools)

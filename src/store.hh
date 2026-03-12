@@ -1,4 +1,5 @@
 #pragma once
+///@file
 
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>

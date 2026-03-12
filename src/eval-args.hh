@@ -1,4 +1,5 @@
 #pragma once
+///@file
 
 #include <nix/flake/flake.hh>
 #include <nix/util/args/root.hh>

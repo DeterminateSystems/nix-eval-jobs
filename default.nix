@@ -16,11 +16,18 @@ stdenv.mkDerivation {
       ./.clang-tidy
       ./meson.build
       ./src/meson.build
+      ./tests-unit/meson.build
       (lib.fileset.fileFilter (file: file.hasExt "cc") ./src)
       (lib.fileset.fileFilter (file: file.hasExt "hh") ./src)
+      (lib.fileset.fileFilter (file: file.hasExt "cc") ./tests-unit)
+      ./tests-unit/data
     ];
     root = ./.;
   };
+  checkInputs = [
+    pkgs.gtest
+    nixComponents.nix-util-test-support
+  ];
   buildInputs = with pkgs; [
     nlohmann_json
     curl
@@ -32,7 +39,7 @@ stdenv.mkDerivation {
     nixComponents.nix-cmd
   ];
   nativeBuildInputs =
-    with pkgs;
+    with pkgs.buildPackages;
     [
       meson
       pkg-config
@@ -45,6 +52,8 @@ stdenv.mkDerivation {
   passthru = {
     inherit nixComponents;
   };
+
+  doCheck = true;
 
   meta = {
     description = "Hydra's builtin hydra-eval-jobs as a standalone";

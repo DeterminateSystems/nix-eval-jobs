@@ -1,0 +1,19 @@
+{
+  "cacheStatus": "cached",
+  "constituents": [],
+  "drvPath": "/nix/store/00000000000000000000000000000000-pkg.drv",
+  "globConstituents": false,
+  "isCached": true,
+  "name": "cached-pkg",
+  "namedConstituents": [],
+  "neededBuilds": [],
+  "neededSubstitutes": [
+    "/nix/store/00000000000000000000000000000000-sub1",
+    "/nix/store/00000000000000000000000000000000-sub2"
+  ],
+  "outputs": {
+    "out": "/nix/store/00000000000000000000000000000000-def"
+  },
+  "storeDir": "/nix/store",
+  "system": "x86_64-linux"
+}

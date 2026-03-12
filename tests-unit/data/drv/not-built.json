@@ -1,0 +1,18 @@
+{
+  "cacheStatus": "notBuilt",
+  "constituents": [],
+  "drvPath": "/nix/store/00000000000000000000000000000000-pkg.drv",
+  "globConstituents": false,
+  "isCached": false,
+  "name": "unbuilt-pkg",
+  "namedConstituents": [],
+  "neededBuilds": [
+    "/nix/store/00000000000000000000000000000001-build1.drv"
+  ],
+  "neededSubstitutes": [],
+  "outputs": {
+    "out": null
+  },
+  "storeDir": "/nix/store",
+  "system": "x86_64-linux"
+}

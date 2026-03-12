@@ -1,0 +1,12 @@
+{
+  "constituents": [],
+  "drvPath": "/nix/store/00000000000000000000000000000000-hello.drv",
+  "globConstituents": false,
+  "name": "hello",
+  "namedConstituents": [],
+  "outputs": {
+    "out": "/nix/store/00000000000000000000000000000000-hello"
+  },
+  "storeDir": "/nix/store",
+  "system": "x86_64-linux"
+}

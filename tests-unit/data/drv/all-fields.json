@@ -1,0 +1,34 @@
+{
+  "cacheStatus": "local",
+  "constituents": [
+    "/nix/store/child.drv"
+  ],
+  "drvPath": "/nix/store/00000000000000000000000000000000-pkg.drv",
+  "globConstituents": false,
+  "inputDrvs": {
+    "/nix/store/00000000000000000000000000000000-input.drv": [
+      "out"
+    ]
+  },
+  "isCached": true,
+  "meta": {
+    "description": "A package",
+    "license": "MIT"
+  },
+  "name": "full-pkg",
+  "namedConstituents": [
+    "childJob"
+  ],
+  "neededBuilds": [],
+  "neededSubstitutes": [],
+  "outputs": {
+    "dev": "/nix/store/00000000000000000000000000000000-ghi",
+    "out": "/nix/store/00000000000000000000000000000000-def"
+  },
+  "requiredSystemFeatures": [
+    "big-parallel",
+    "kvm"
+  ],
+  "storeDir": "/nix/store",
+  "system": "x86_64-linux"
+}

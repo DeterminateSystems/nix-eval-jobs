@@ -1,0 +1,11 @@
+{
+  "attr": "pkgs",
+  "attrPath": [
+    "pkgs"
+  ],
+  "attrs": [
+    "foo",
+    "bar",
+    "baz"
+  ]
+}

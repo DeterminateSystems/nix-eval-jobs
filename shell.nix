@@ -24,7 +24,7 @@ let
   };
 in
 (pkgs.mkShell.override { inherit stdenv; }) {
-  inherit (nix-eval-jobs) buildInputs;
+  buildInputs = nix-eval-jobs.buildInputs ++ (nix-eval-jobs.checkInputs or [ ]);
   nativeBuildInputs = nix-eval-jobs.nativeBuildInputs ++ [
     (pkgs.python3.withPackages (ps: [ ps.pytest ]))
     (lib.hiPrio pkgs.llvmPackages.clang-tools)

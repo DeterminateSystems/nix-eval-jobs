@@ -37,7 +37,6 @@
 #include <nix/util/util.hh>
 #include <sys/signal.h>
 #include <variant>
-#include <nlohmann/detail/iterators/iter_impl.hpp>
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
@@ -54,6 +53,7 @@
 #include "eval-args.hh"
 #include "buffered-io.hh"
 #include "worker.hh"
+#include "response.hh"
 #include "strings-portable.hh"
 #include "output-stream-lock.hh"
 #include "constituents.hh"
@@ -368,30 +368,38 @@ auto processWorkerResponse(LineReader *fromReader,
         handleBrokenWorkerPipe(*proc, msg);
     }
 
-    // Parse JSON response
-    nlohmann::json response;
+    // Parse and deserialize the typed response
+    nlohmann::json jsonResponse;
     try {
-        response = nlohmann::json::parse(respString);
+        jsonResponse = nlohmann::json::parse(respString);
     } catch (const nlohmann::json::exception &e) {
         throw nix::Error("Received invalid JSON from worker: %s\n json: '%s'",
                          e.what(), respString);
     }
+    auto response = jsonResponse.get<Response>();
 
-    // Process the response
+    // Dispatch on the response payload
     std::vector<nlohmann::json> newAttrs;
-    if (response.find("attrs") != response.end()) {
-        for (const auto &attr : response["attrs"]) {
-            nlohmann::json newAttr = nlohmann::json(response["attrPath"]);
+    if (auto *attrs = std::get_if<Response::Attrs>(&response.payload)) {
+        for (const auto &attr : attrs->attrs) {
+            nlohmann::json newAttr(response.attrPath);
             newAttr.emplace_back(attr);
             newAttrs.push_back(newAttr);
         }
     } else {
         {
             auto state(state_.lock());
-            state->jobs.insert_or_assign(response["attr"], response);
+            state->jobs.insert_or_assign(response.attr,
+                                         std::move(jsonResponse));
         }
-        auto named = response.find("namedConstituents");
-        if (named == response.end() || named->empty()) {
+
+        bool hasPendingConstituents = false;
+        if (auto *job = std::get_if<Response::Job>(&response.payload)) {
+            hasPendingConstituents =
+                !job->drv.constituents.namedConstituents.empty();
+        }
+
+        if (!hasPendingConstituents) {
             getCoutLock().lock() << respString << "\n";
         }
     }
