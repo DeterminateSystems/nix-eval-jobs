@@ -1,7 +1,7 @@
 {
   description = "Hydra's builtin hydra-eval-jobs as a standalone";
 
-  inputs.nix.url = "https://flakehub.com/f/DeterminateSystems/nix-src/3";
+  inputs.nix.url = "github:DeterminateSystems/nix-src";
   inputs.nixpkgs.follows = "nix/nixpkgs";
 
   inputs.flake-parts.url = "github:hercules-ci/flake-parts";
