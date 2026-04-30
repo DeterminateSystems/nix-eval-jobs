@@ -513,17 +513,14 @@ def test_recursion_error() -> None:
             cmd,
             cwd=TEST_ROOT.joinpath("assets"),
             text=True,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
+        print(res.stdout)
         assert res.returncode == 1
-        print(res.stderr)
-        assert "packageWithInfiniteRecursion" in res.stderr
-        expected_errors = [
-            "error: BUG: while reading result for attrPath 'packageWithInfiniteRecursion', worker pipe got closed but evaluation worker still running?",
-            "possible infinite recursion",
-            "error: while reading result for attrPath 'packageWithInfiniteRecursion', evaluation worker got killed by signal 6",
-        ]
-        assert any(err in res.stderr for err in expected_errors)
+        result = json.loads(res.stdout)
+        assert result["attr"] == "packageWithInfiniteRecursion"
+        assert result["fatal"] is True
+        assert "max-call-depth exceeded" in result["error"]
 
 
 def test_no_instantiate_mode() -> None:

@@ -1,0 +1,11 @@
+{
+  "constituents": [
+    "/nix/store/abc-foo.drv",
+    "/nix/store/def-bar.drv"
+  ],
+  "globConstituents": true,
+  "namedConstituents": [
+    "foo",
+    "bar"
+  ]
+}

@@ -1,4 +1,5 @@
 #pragma once
+///@file
 
 #include <exception>
 #include <map>
@@ -47,4 +48,4 @@ auto resolveNamedConstituents(const std::map<std::string, nlohmann::json> &jobs)
 void rewriteAggregates(std::map<std::string, nlohmann::json> &jobs,
                        const std::vector<AggregateJob> &aggregateJobs,
                        const nix::ref<nix::LocalFSStore> &store,
-                       const nix::Path &gcRootsDir);
+                       const std::filesystem::path &gcRootsDir);

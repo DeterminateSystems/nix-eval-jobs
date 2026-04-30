@@ -21,3 +21,8 @@ nix_main_dep = dependency('nix-main', required: true)
 nix_cmd_dep = dependency('nix-cmd', required: true)
 
 subdir('src')
+
+gtest_dep = dependency('gtest', main: true, required: false)
+if gtest_dep.found()
+  subdir('tests-unit')
+endif

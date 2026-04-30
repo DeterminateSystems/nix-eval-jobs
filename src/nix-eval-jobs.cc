@@ -37,7 +37,6 @@
 #include <nix/util/util.hh>
 #include <sys/signal.h>
 #include <variant>
-#include <nlohmann/detail/iterators/iter_impl.hpp>
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
@@ -54,6 +53,7 @@
 #include "eval-args.hh"
 #include "buffered-io.hh"
 #include "worker.hh"
+#include "response.hh"
 #include "strings-portable.hh"
 #include "output-stream-lock.hh"
 #include "constituents.hh"
@@ -368,31 +368,44 @@ auto processWorkerResponse(LineReader *fromReader,
         handleBrokenWorkerPipe(*proc, msg);
     }
 
-    // Parse JSON response
-    nlohmann::json response;
+    // Parse and deserialize the typed response
+    nlohmann::json jsonResponse;
     try {
-        response = nlohmann::json::parse(respString);
+        jsonResponse = nlohmann::json::parse(respString);
     } catch (const nlohmann::json::exception &e) {
         throw nix::Error("Received invalid JSON from worker: %s\n json: '%s'",
                          e.what(), respString);
     }
+    auto response = jsonResponse.get<Response>();
 
-    // Process the response
+    // Dispatch on the response payload
     std::vector<nlohmann::json> newAttrs;
-    if (response.find("attrs") != response.end()) {
-        for (const auto &attr : response["attrs"]) {
-            nlohmann::json newAttr = nlohmann::json(response["attrPath"]);
+    if (auto *attrs = std::get_if<Response::Attrs>(&response.payload)) {
+        for (const auto &attr : attrs->attrs) {
+            nlohmann::json newAttr(response.attrPath);
             newAttr.emplace_back(attr);
             newAttrs.push_back(newAttr);
         }
     } else {
         {
             auto state(state_.lock());
-            state->jobs.insert_or_assign(response["attr"], response);
+            state->jobs.insert_or_assign(response.attr,
+                                         std::move(jsonResponse));
         }
-        auto named = response.find("namedConstituents");
-        if (named == response.end() || named->empty()) {
+
+        bool hasPendingConstituents = false;
+        if (auto *job = std::get_if<Response::Job>(&response.payload)) {
+            hasPendingConstituents =
+                !job->drv.constituents.namedConstituents.empty();
+        }
+
+        if (!hasPendingConstituents) {
             getCoutLock().lock() << respString << "\n";
+        }
+
+        if (auto *error = std::get_if<Response::Error>(&response.payload);
+            (error != nullptr) && error->fatal) {
+            throw nix::Error("%s", error->error);
         }
     }
 
@@ -518,7 +531,7 @@ auto main(int argc, char **argv) -> int {
 
         /* FIXME: The build hook in conjunction with import-from-derivation is
          * causing "unexpected EOF" during eval */
-        nix::settings.builders = "";
+        nix::settings.getWorkerSettings().builders = "";
 
         /* Set no-instantiate mode if requested (makes evaluation faster) */
         if (myArgs.noInstantiate) {
@@ -546,6 +559,15 @@ auto main(int argc, char **argv) -> int {
         }
 
         nix::Sync<State> state_;
+
+        /* Pre-initialize the eval store (if specified) before spawning
+           workers so that the SQLite database and schema are created
+           exactly once.  Without this, forked workers race to create
+           a fresh store and hit SQLite "busy" / "schema is corrupt"
+           errors.  See https://github.com/NixOS/nix-eval-jobs/issues/401 */
+        if (myArgs.evalStoreUrl.has_value()) {
+            nix_eval_jobs::openStore(myArgs.evalStoreUrl);
+        }
 
         /* Start a collector thread per worker process. */
         std::vector<Thread> threads;
