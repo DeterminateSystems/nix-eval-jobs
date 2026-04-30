@@ -29,10 +29,25 @@ cd build
 ninja
 ```
 
-### Running Tests
+### Running Unit Tests
+
+Unit tests use [gtest](https://github.com/google/googletest) with golden master
+JSON files (via nix's `JsonCharacterizationTest` from `nix-util-test-support`).
 
 ```bash
-pytest ./tests
+meson test -C build
+```
+
+To update golden master files after an intentional serialization change:
+
+```bash
+_NIX_TEST_ACCEPT=1 meson test -C build
+```
+
+### Running Functional Tests
+
+```bash
+pytest ./tests-functional
 ```
 
 ### Checking Everything

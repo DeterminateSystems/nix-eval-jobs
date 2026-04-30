@@ -1,25 +1,24 @@
+#include <filesystem>
 #include <fnmatch.h>
-#include <cassert>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <set>
-#include <unordered_map>
 #include <functional>
-#include <variant>
-#include <nlohmann/json.hpp>
-#include <nlohmann/json_fwd.hpp>
+#include <map>
 #include <nix/store/derivations.hh>
 #include <nix/store/local-fs-store.hh>
-#include <nix/util/ref.hh>
 #include <nix/store/path.hh>
-#include <nix/util/logging.hh>
 #include <nix/util/error.hh>
-#include <nix/util/fmt.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/fmt.hh>
+#include <nix/util/logging.hh>
+#include <nix/util/ref.hh>
 #include <nix/util/types.hh>
-#include <nix/util/util.hh>
+#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <variant>
+#include <vector>
 
 #include "constituents.hh"
 #include "output-stream-lock.hh"
@@ -122,34 +121,31 @@ void addConstituents(nlohmann::json &job, nix::Derivation &drv,
     }
 }
 
-auto rewriteDerivation(nlohmann::json &job, nix::Derivation &drv,
-                       const nix::StorePath &drvPath,
-                       const nix::ref<nix::LocalFSStore> &store,
-                       const nix::Path &gcRootsDir) -> bool {
-    std::string drvName(drvPath.name());
-    assert(nix::hasSuffix(drvName, nix::drvExtension));
-    drvName.resize(drvName.size() - nix::drvExtension.size());
-
-    auto hashModulo = hashDerivationModulo(*store, drv, true);
-    if (hashModulo.kind != nix::DrvHash::Kind::Regular) {
-        return false;
+void rewriteAndRegisterDrv(nlohmann::json &job, nix::Derivation &drv,
+                           const nix::StorePath &drvPath,
+                           const nix::ref<nix::LocalFSStore> &store,
+                           const std::filesystem::path &gcRootsDir) {
+    // Reset outputs so fillInOutputPaths recomputes them
+    // with the updated inputDrvs (constituents).
+    for (auto &[name, output] : drv.outputs) {
+        if (std::holds_alternative<nix::DerivationOutput::InputAddressed>(
+                output.raw)) {
+            output = nix::DerivationOutput::Deferred{};
+            drv.env[name] = "";
+        }
     }
-    auto hashIter = hashModulo.hashes.find("out");
-    if (hashIter == hashModulo.hashes.end()) {
-        return false;
-    }
-    auto outPath = store->makeOutputPath("out", hashIter->second, drvName);
-    drv.env["out"] = store->printStorePath(outPath);
-    drv.outputs.insert_or_assign(
-        "out", nix::DerivationOutput::InputAddressed{.path = outPath});
+    drv.fillInOutputPaths(*store);
 
-    auto newDrvPath = nix::writeDerivation(*store, drv);
+    auto newDrvPath = store->writeDerivation(drv);
+    if (newDrvPath == drvPath) {
+        return;
+    }
+
     auto newDrvPathS = store->printStorePath(newDrvPath);
 
     if (!gcRootsDir.empty()) {
-        const nix::Path root =
-            gcRootsDir + "/" + std::string(nix::baseNameOf(newDrvPathS));
-
+        const auto root =
+            gcRootsDir / std::string(nix::baseNameOf(newDrvPathS));
         if (!nix::pathExists(root)) {
             store->addPermRoot(newDrvPath, root);
         }
@@ -160,8 +156,9 @@ auto rewriteDerivation(nlohmann::json &job, nix::Derivation &drv,
                               store->printStorePath(drvPath), newDrvPathS));
 
     job["drvPath"] = newDrvPathS;
-    job["outputs"]["out"] = store->printStorePath(outPath);
-    return true;
+    for (const auto &[name, output] : drv.outputs) {
+        job["outputs"][name] = drv.env.at(name);
+    }
 }
 
 void addBrokenJobsError(
@@ -240,7 +237,7 @@ auto resolveNamedConstituents(const std::map<std::string, nlohmann::json> &jobs)
 void rewriteAggregates(std::map<std::string, nlohmann::json> &jobs,
                        const std::vector<AggregateJob> &aggregateJobs,
                        const nix::ref<nix::LocalFSStore> &store,
-                       const nix::Path &gcRootsDir) {
+                       const std::filesystem::path &gcRootsDir) {
     for (const auto &aggregateJob : aggregateJobs) {
         auto &job = jobs.find(aggregateJob.name)->second;
         auto drvPath = store->parseStorePath(std::string(job["drvPath"]));
@@ -248,7 +245,7 @@ void rewriteAggregates(std::map<std::string, nlohmann::json> &jobs,
 
         if (aggregateJob.brokenJobs.empty()) {
             addConstituents(job, drv, aggregateJob.dependencies, jobs, store);
-            rewriteDerivation(job, drv, drvPath, store, gcRootsDir);
+            rewriteAndRegisterDrv(job, drv, drvPath, store, gcRootsDir);
         }
 
         job.erase("namedConstituents");

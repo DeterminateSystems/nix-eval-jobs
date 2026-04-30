@@ -1,7 +1,9 @@
 { stdenv, lib, nixComponents, pkgs, }:
 
-let revision = "0";
-in stdenv.mkDerivation {
+let
+  revision = "1";
+in
+stdenv.mkDerivation {
   pname = "nix-eval-jobs";
   version =
     "${lib.versions.majorMinor nixComponents.nix-cli.version}.${revision}";
@@ -10,11 +12,18 @@ in stdenv.mkDerivation {
       ./.clang-tidy
       ./meson.build
       ./src/meson.build
+      ./tests-unit/meson.build
       (lib.fileset.fileFilter (file: file.hasExt "cc") ./src)
       (lib.fileset.fileFilter (file: file.hasExt "hh") ./src)
+      (lib.fileset.fileFilter (file: file.hasExt "cc") ./tests-unit)
+      ./tests-unit/data
     ];
     root = ./.;
   };
+  checkInputs = [
+    pkgs.gtest
+    nixComponents.nix-util-test-support
+  ];
   buildInputs = with pkgs; [
     nlohmann_json
     curl
@@ -25,7 +34,8 @@ in stdenv.mkDerivation {
     nixComponents.nix-main
     nixComponents.nix-cmd
   ];
-  nativeBuildInputs = with pkgs;
+  nativeBuildInputs =
+    with pkgs.buildPackages;
     [
       meson
       pkg-config
@@ -36,6 +46,8 @@ in stdenv.mkDerivation {
     (lib.hiPrio pkgs.llvmPackages.clang-tools);
 
   passthru = { inherit nixComponents; };
+
+  doCheck = true;
 
   meta = {
     description = "Hydra's builtin hydra-eval-jobs as a standalone";

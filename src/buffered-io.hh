@@ -1,4 +1,6 @@
 #pragma once
+///@file
+
 #include <cstdio>
 #include <string>
 #include <string_view>

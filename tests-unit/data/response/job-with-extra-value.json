@@ -1,0 +1,20 @@
+{
+  "attr": "pkg",
+  "attrPath": [
+    "pkg"
+  ],
+  "constituents": [],
+  "drvPath": "/nix/store/00000000000000000000000000000000-pkg.drv",
+  "extraValue": {
+    "custom": true,
+    "version": "1.0"
+  },
+  "globConstituents": false,
+  "name": "pkg",
+  "namedConstituents": [],
+  "outputs": {
+    "out": "/nix/store/00000000000000000000000000000000-def"
+  },
+  "storeDir": "/nix/store",
+  "system": "x86_64-linux"
+}

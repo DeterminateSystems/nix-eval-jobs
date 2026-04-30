@@ -43,17 +43,24 @@
 
           checks = builtins.removeAttrs self'.packages [ "default" ] // {
             shell = self'.devShells.default;
-            tests = pkgs.runCommand "nix-eval-jobs-tests" {
-              src = lib.fileset.toSource {
-                fileset = lib.fileset.unions [ ./tests ];
-                root = ./.;
-              };
+            functional-tests =
+              pkgs.runCommand "nix-eval-jobs-functional-tests"
+                {
+                  src = lib.fileset.toSource {
+                    fileset = lib.fileset.unions [
+                      ./tests-functional
+                    ];
+                    root = ./.;
+                  };
 
-              nativeBuildInputs =
-                [ self'.packages.nix-eval-jobs pkgs.python3.pkgs.pytest ];
-            } ''
-              # Copy test files
-              cp -r $src/tests .
+                  nativeBuildInputs = [
+                    self'.packages.nix-eval-jobs
+                    pkgs.python3.pkgs.pytest
+                  ];
+                }
+                ''
+                  # Copy test files
+                  cp -r $src/tests-functional .
 
               # Set up test environment
               export HOME=$TMPDIR
@@ -66,15 +73,18 @@
               # Use the pre-built nix-eval-jobs binary
               export NIX_EVAL_JOBS_BIN=${self'.packages.nix-eval-jobs}/bin/nix-eval-jobs
 
-              # Run the tests
-              pytest tests/ -v
+                  # Run the tests
+                  pytest tests-functional/ -v
 
               # Create output marker
               touch $out
             '';
             clang-tidy-fix = self'.packages.nix-eval-jobs.overrideAttrs (old: {
-              nativeBuildInputs = old.nativeBuildInputs
-                ++ [ pkgs.git (lib.hiPrio pkgs.llvmPackages.clang-tools) ];
+              pname = "nix-eval-jobs-clang-tidy";
+              nativeBuildInputs = old.nativeBuildInputs ++ [
+                pkgs.git
+                (lib.hiPrio pkgs.llvmPackages.clang-tools)
+              ];
               buildPhase = ''
                 export HOME=$TMPDIR
                 cat > $HOME/.gitconfig <<EOF

@@ -47,6 +47,7 @@
 
 #include "worker.hh"
 #include "drv.hh"
+#include "response.hh"
 #include "buffered-io.hh"
 #include "eval-args.hh"
 #include "store.hh"
@@ -111,9 +112,9 @@ auto attrPathJoin(nlohmann::json input) -> std::string {
 }
 
 auto extractConstituents(nix::EvalState &state, nix::Value *value,
-                         const MyArgs &args) -> std::optional<Constituents> {
+                         const MyArgs &args) -> Constituents {
     if (!args.constituents) {
-        return std::nullopt;
+        return {};
     }
 
     std::vector<std::string> constituents;
@@ -182,7 +183,11 @@ auto extractConstituents(nix::EvalState &state, nix::Value *value,
                 "while evaluating the `_hydraGlobConstituents` attribute");
     }
 
-    return Constituents(constituents, namedConstituents, globConstituents);
+    return Constituents{
+        .constituents = std::move(constituents),
+        .namedConstituents = std::move(namedConstituents),
+        .globConstituents = globConstituents,
+    };
 }
 
 auto applyExprToValue(nix::EvalState &state, nix::Value *value,
@@ -209,19 +214,17 @@ auto applyExprToValue(nix::EvalState &state, nix::Value *value,
 
 auto registerGCRoot(nix::EvalState &state, const Drv &drv, const MyArgs &args)
     -> void {
-    if (args.gcRootsDir.empty() || nix::settings.readOnlyMode ||
-        drv.drvPath.empty()) {
+    if (args.gcRootsDir.empty() || nix::settings.readOnlyMode) {
         return;
     }
 
-    const nix::Path root =
-        args.gcRootsDir + "/" + std::string(nix::baseNameOf(drv.drvPath));
+    const std::filesystem::path root =
+        args.gcRootsDir / std::string(drv.drvPath.to_string());
 
     if (!nix::pathExists(root)) {
         auto localStore = state.store.dynamic_pointer_cast<nix::LocalFSStore>();
         if (localStore) {
-            auto storePath = localStore->parseStorePath(drv.drvPath);
-            localStore->addPermRoot(storePath, root);
+            localStore->addPermRoot(drv.drvPath, root);
         }
         // If not a local store, we can't create GC roots
     }
@@ -229,15 +232,15 @@ auto registerGCRoot(nix::EvalState &state, const Drv &drv, const MyArgs &args)
 
 auto collectAttrsForRecursion(nix::EvalState &state, nix::Value *value,
                               const nlohmann::json &path, const MyArgs &args)
-    -> nlohmann::json {
-    auto attrs = nlohmann::json::array();
+    -> std::vector<std::string> {
+    std::vector<std::string> attrs;
     bool recurse =
         args.forceRecurse ||
         path.empty(); // Don't require recurseForDerivations for top-level
 
     for (auto &attr : value->attrs()->lexicographicOrder(state.symbols)) {
         const std::string_view &name = state.symbols[attr->name];
-        attrs.push_back(name);
+        attrs.emplace_back(name);
 
         if (!args.forceRecurse && name == "recurseForDerivations") {
             const auto *attrv =
@@ -247,33 +250,35 @@ auto collectAttrsForRecursion(nix::EvalState &state, nix::Value *value,
         }
     }
 
-    return recurse ? attrs : nlohmann::json::array();
+    return recurse ? attrs : std::vector<std::string>{};
 }
 
 auto processDerivation(nix::EvalState &state, nix::Value *value,
                        std::string &attrPathS, const nlohmann::json &path,
-                       MyArgs &args, nlohmann::json &reply) -> void {
+                       MyArgs &args) -> Response::Payload {
     auto packageInfo = nix::getDerivation(state, *value, false);
     if (!packageInfo) {
         auto attrs = collectAttrsForRecursion(state, value, path, args);
-        reply["attrs"] = attrs;
-        return;
+        return Response::Attrs{std::move(attrs)};
     }
 
     // Extract constituents if enabled
-    auto maybeConstituents = extractConstituents(state, value, args);
+    auto constituents = extractConstituents(state, value, args);
 
     // Apply expression if provided
+    std::optional<nlohmann::json> extraValue;
     if (!args.applyExpr.empty()) {
-        reply["extraValue"] = applyExprToValue(state, value, args.applyExpr);
+        extraValue = applyExprToValue(state, value, args.applyExpr);
     }
 
     // Create derivation info
-    auto drv = Drv(attrPathS, state, *packageInfo, args, maybeConstituents);
-    reply.update(drv);
+    auto drv = Drv::fromPackageInfo(attrPathS, state, *packageInfo, args,
+                                    std::move(constituents));
 
     // Register GC root
     registerGCRoot(state, drv, args);
+
+    return Response::Job{std::move(drv), std::move(extraValue)};
 }
 
 auto initializeRootValue(const nix::ref<nix::EvalState> &state,
@@ -336,40 +341,53 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
     auto attrPathS = attrPathJoin(path);
 
     /* Evaluate it and send info back to the collector. */
-    nlohmann::json reply =
-        nlohmann::json{{"attr", attrPathS}, {"attrPath", path}};
+    Response::Payload payload = [&]() -> Response::Payload {
+        try {
+            auto *vTmp =
+                nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot)
+                    .first;
 
-    try {
-        auto *vTmp =
-            nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot).first;
+            auto *value = state.allocValue();
+            state.autoCallFunction(autoArgs, *vTmp, *value);
 
-        auto *value = state.allocValue();
-        state.autoCallFunction(autoArgs, *vTmp, *value);
-
-        if (value->type() == nix::nAttrs) {
-            processDerivation(state, value, attrPathS, path, args, reply);
-        } else {
+            if (value->type() == nix::nAttrs) {
+                return processDerivation(state, value, attrPathS, path, args);
+            }
             // We ignore everything that cannot be built
-            reply["attrs"] = nlohmann::json::array();
+            return Response::Attrs{{}};
+        } catch (nix::EvalError &e) {
+            const auto &err = e.info();
+            std::ostringstream oss;
+            nix::showErrorInfo(oss, err, nix::loggerSettings.showTrace.get());
+            auto msg = oss.str();
+
+            // Print to STDERR for Hydra UI
+            std::cerr << msg << "\n";
+            return Response::Error{nix::filterANSIEscapes(msg, true)};
+        } catch (const std::exception &e) {
+            // FIXME: for some reason the catch block above doesn't trigger on
+            // macOS (?)
+            const auto *msg = e.what();
+            std::cerr << msg << '\n';
+            return Response::Error{
+                .error = nix::filterANSIEscapes(msg, true),
+                // Nix 2.34 throws `StackOverflowError` whreas before, Nix
+                // actually exhausted the C/C++ stack and crashed the worker.
+                //
+                // Mark this error fatal so the collector replicates the old
+                // fail-on-infinite-recursion behavior.
+                .fatal = dynamic_cast<const nix::StackOverflowError *>(&e) !=
+                         nullptr,
+            };
         }
-    } catch (nix::EvalError &e) {
-        const auto &err = e.info();
-        std::ostringstream oss;
-        nix::showErrorInfo(oss, err, nix::loggerSettings.showTrace.get());
-        auto msg = oss.str();
+    }();
 
-        // Transmit the error in JSON output
-        reply["error"] = nix::filterANSIEscapes(msg, true);
-        // Print to STDERR for Hydra UI
-        std::cerr << msg << "\n";
-    } catch (const std::exception &e) {
-        // FIXME: for some reason the catch block above doesn't trigger on macOS
-        // (?)
-        const auto *msg = e.what();
-        reply["error"] = nix::filterANSIEscapes(msg, true);
-        std::cerr << msg << '\n';
-    }
-
+    Response const response{
+        .attr = attrPathS,
+        .attrPath = path.get<std::vector<std::string>>(),
+        .payload = std::move(payload),
+    };
+    nlohmann::json const reply = response;
     if (tryWriteLine(toParent.get(), reply.dump()) < 0) {
         return false; // main process died
     }

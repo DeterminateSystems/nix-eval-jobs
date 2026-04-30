@@ -1,4 +1,8 @@
 #pragma once
+///@file
+
+#include <string>
+#include <filesystem>
 
 #include <nix/flake/flake.hh>
 #include <nix/util/args/root.hh>
@@ -6,7 +10,6 @@
 #include <cstddef>
 #include <nix/main/common-args.hh>
 #include <nix/util/types.hh>
-#include <string>
 
 class MyArgs : virtual public nix::MixEvalArgs,
                virtual public nix::MixCommonArgs,
@@ -18,7 +21,7 @@ class MyArgs : virtual public nix::MixEvalArgs,
     std::string releaseExpr;
     std::string applyExpr;
     std::string selectExpr;
-    nix::Path gcRootsDir;
+    std::filesystem::path gcRootsDir;
     bool flake = false;
     bool fromArgs = false;
     bool meta = false;
