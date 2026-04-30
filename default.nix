@@ -1,12 +1,16 @@
-{ stdenv, lib, nixComponents, pkgs, }:
+{
+  stdenv,
+  lib,
+  nixComponents,
+  pkgs,
+}:
 
 let
   revision = "1";
 in
 stdenv.mkDerivation {
   pname = "nix-eval-jobs";
-  version =
-    "${lib.versions.majorMinor nixComponents.nix-cli.version}.${revision}";
+  version = "${lib.versions.majorMinor nixComponents.nix-cli.version}.${revision}";
   src = lib.fileset.toSource {
     fileset = lib.fileset.unions [
       ./.clang-tidy
@@ -42,8 +46,8 @@ stdenv.mkDerivation {
       ninja
       # nlohmann_json can be only discovered via cmake files
       cmake
-    ] ++ lib.optional stdenv.cc.isClang
-    (lib.hiPrio pkgs.llvmPackages.clang-tools);
+    ]
+    ++ lib.optional stdenv.cc.isClang (lib.hiPrio pkgs.llvmPackages.clang-tools);
 
   passthru = { inherit nixComponents; };
 
@@ -53,7 +57,10 @@ stdenv.mkDerivation {
     description = "Hydra's builtin hydra-eval-jobs as a standalone";
     homepage = "https://github.com/nix-community/nix-eval-jobs";
     license = lib.licenses.gpl3;
-    maintainers = with lib.maintainers; [ adisbladis mic92 ];
+    maintainers = with lib.maintainers; [
+      adisbladis
+      mic92
+    ];
     platforms = lib.platforms.unix;
   };
 }
