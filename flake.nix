@@ -67,6 +67,7 @@
                   nativeBuildInputs = [
                     self'.packages.nix-eval-jobs
                     pkgs.python3.pkgs.pytest
+                    pkgs.nix
                   ];
                 }
                 ''

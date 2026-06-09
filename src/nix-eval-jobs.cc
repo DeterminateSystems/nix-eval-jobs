@@ -17,24 +17,29 @@
 #include <map>
 #include <memory>
 #include <nix/cmd/common-eval-args.hh>
-#include <nix/util/configuration.hh>
-#include <nix/util/error.hh>
 #include <nix/expr/eval-gc.hh>
 #include <nix/expr/eval-settings.hh>
 #include <nix/expr/eval.hh> // NOLINT(misc-header-include-cycle)
-#include <nix/util/file-descriptor.hh>
 #include <nix/flake/flake.hh>
 #include <nix/flake/settings.hh>
-#include <nix/util/fmt.hh>
+#include <nix/main/shared.hh>
 #include <nix/store/globals.hh>
 #include <nix/store/local-fs-store.hh>
+#include <nix/util/configuration.hh>
+#include <nix/util/error.hh>
+#include <nix/util/file-descriptor.hh>
+#include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/processes.hh>
-#include <nix/main/shared.hh>
 #include <nix/util/signals.hh> // NOLINT(misc-header-include-cycle)
 #include <nix/util/sync.hh>
 #include <nix/util/terminal.hh>
 #include <nix/util/util.hh>
+#ifdef __linux__
+#include <sched.h>
+#include <nix/util/linux-namespaces.hh>
+#include <nix/util/users.hh>
+#endif
 #include <sys/signal.h>
 #include <variant>
 #include <nlohmann/json.hpp>
@@ -57,6 +62,7 @@
 #include "strings-portable.hh"
 #include "output-stream-lock.hh"
 #include "constituents.hh"
+#include "daemon-settings.hh"
 #include "store.hh"
 
 namespace {
@@ -521,9 +527,26 @@ auto main(int argc, char **argv) -> int {
     auto args = std::span(argv, argc);
 
     return nix::handleExceptions(args[0], [&]() -> void {
+        nix_eval_jobs::registerDaemonSettings();
         nix::initNix();
         nix::initGC();
         nix::flakeSettings.configureEvalSettings(nix::evalSettings);
+
+#ifdef __linux__
+        /* Mirrors src/nix/main.cc: prevent LocalStore::makeStoreWritable
+           from stripping ro/nosuid/nodev on the host's /nix/store mount. */
+        if (nix::isRootUser()) {
+            try {
+                nix::saveMountNamespace();
+                if (unshare(CLONE_NEWNS) == -1) {
+                    throw nix::SysError("setting up a private mount namespace");
+                }
+            } catch (nix::Error &e) {
+                nix::warn("failed to set up a private mount namespace: %s",
+                          e.msg());
+            }
+        }
+#endif
 
         myArgs.parseArgs(argv, argc);
 
