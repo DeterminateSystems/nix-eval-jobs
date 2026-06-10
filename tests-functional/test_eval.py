@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 
+import contextlib
+import functools
+import http.server
 import json
 import os
+import shutil
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+import pytest
 
 TEST_ROOT = Path(__file__).parent.resolve()
 PROJECT_ROOT = TEST_ROOT.parent
@@ -149,6 +157,26 @@ def test_no_gcroot_dir() -> None:
     attrs = json.loads(res.stdout)
     assert attrs["attr"] == "brokenPackage"
     assert "this is an evaluation error" in attrs["error"]
+
+
+def test_daemon_only_settings_do_not_warn(tmp_path: Path) -> None:
+    nix_conf_dir = tmp_path / "nix-conf"
+    nix_conf_dir.mkdir()
+    nix_conf_dir.joinpath("nix.conf").write_text("allowed-users = *\ntrusted-users = root @admin\n")
+
+    env = os.environ.copy()
+    env["NIX_CONF_DIR"] = str(nix_conf_dir)
+
+    res = subprocess.run(
+        [str(BIN), "--expr", "42"],
+        cwd=TEST_ROOT.joinpath("assets"),
+        env=env,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+
+    assert "warning:" not in res.stderr
 
 
 def test_constituents() -> None:
@@ -586,3 +614,139 @@ def test_no_instantiate_mode() -> None:
 
         # No GC roots should be created in no-instantiate mode
         assert len(list(Path(tempdir).iterdir())) == 0
+
+
+# sandbox=false: NIX_STORE_DIR under /build collides with sandbox-build-dir
+# when these tests run inside a Nix build.
+_HERMETIC_NIX_OPTS = [
+    "--extra-experimental-features",
+    "nix-command flakes",
+    "--option",
+    "substituters",
+    "",
+    "--option",
+    "sandbox",
+    "false",
+    "--option",
+    "require-sigs",
+    "false",
+]
+
+
+def _hermetic_nix_env(tmp_path: Path) -> dict[str, str]:
+    """Per-test nix env that confines all stores/state/logs to tmp_path.
+
+    Mirrors nix's own functional-test setup (tests/functional/common/vars.sh)
+    so nix-collect-garbage etc. can never touch the host store.
+    """
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "NIX_STORE_DIR": str(tmp_path / "store"),
+        "NIX_LOCALSTATE_DIR": str(tmp_path / "var"),
+        "NIX_STATE_DIR": str(tmp_path / "var/nix"),
+        "NIX_LOG_DIR": str(tmp_path / "var/log/nix"),
+        "NIX_CONF_DIR": str(tmp_path / "conf"),
+        "NIX_DAEMON_SOCKET_PATH": str(tmp_path / "daemon-socket"),
+        # Force single-user mode so the *_DIR overrides take effect; otherwise
+        # macOS (and any daemon-installed Linux) routes through the system
+        # daemon and writes into the host store.
+        "NIX_REMOTE": "",
+        # /tmp is a symlink to /private/tmp on macOS; without this nix refuses
+        # to use a store rooted under a symlinked path.
+        "NIX_IGNORE_SYMLINK_STORE": "1",
+    }
+    for var in ("NIX_USER_CONF_FILES", "NIX_PATH"):
+        env.pop(var, None)
+    Path(env["NIX_CONF_DIR"]).mkdir()
+    return env
+
+
+def _make_nix_runner(env: dict[str, str], cwd: Path):
+    def nix(*args: str, capture: bool = False) -> str:
+        cmd = ["nix", *_HERMETIC_NIX_OPTS, *args]
+        if capture:
+            return subprocess.check_output(cmd, cwd=cwd, env=env, text=True).strip()
+        subprocess.check_call(cmd, cwd=cwd, env=env)
+        return ""
+
+    return nix
+
+
+@contextlib.contextmanager
+def _http_server(directory: Path):
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+@pytest.mark.skipif(shutil.which("nix") is None, reason="requires nix CLI")
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "needs a real nested `nix build`; on macOS Nix still configures a "
+        "sandbox-exec profile even with sandbox=false, which cannot be nested "
+        "inside the functional-tests build sandbox "
+        "(sandbox initialization failed: Operation not permitted)"
+    ),
+)
+@pytest.mark.parametrize("scheme", ["file", "http"])
+def test_fod_with_uncached_input_issue413(tmp_path: Path, scheme: str) -> None:
+    """An FOD whose output is in a substituter must report cacheStatus=cached,
+    even when its build-time-only input drv is absent from every substituter.
+    `nix build` would just download the FOD output and never invoke the input
+    builder.
+
+    Parametrised across the file:// and http:// substituter transports;
+    nix-eval-jobs uses querySubstitutablePathInfos in both cases (per-path,
+    no WantMassQuery gate), but the underlying store implementations differ.
+    """
+    env = _hermetic_nix_env(tmp_path)
+    assets = TEST_ROOT.joinpath("assets")
+    cache = tmp_path / "cache"
+    nix = _make_nix_runner(env, assets)
+
+    nix_system = nix("eval", "--impure", "--raw", "--expr", "builtins.currentSystem", capture=True)
+    flake_attr = f".#legacyPackages.{nix_system}.fodIssue413"
+
+    fod_out = nix("build", "--no-link", "--print-out-paths", f"{flake_attr}.fod", capture=True)
+
+    # Only the FOD output reaches the cache; the build input stays un-pushed.
+    nix("copy", "--to", f"file://{cache}", fod_out)
+    subprocess.check_call(["nix-collect-garbage", "-d"], env=env)
+
+    with contextlib.ExitStack() as stack:
+        if scheme == "file":
+            substituter = f"file://{cache}"
+        else:
+            substituter = stack.enter_context(_http_server(cache))
+        res = subprocess.check_output(
+            [
+                str(BIN),
+                "--gc-roots-dir",
+                str(tmp_path / "gc"),
+                *COMMON_FLAGS,
+                "--option",
+                "substituters",
+                substituter,
+                "--option",
+                "require-sigs",
+                "false",
+                "--check-cache-status",
+                "--flake",
+                flake_attr,
+            ],
+            cwd=assets,
+            env=env,
+            text=True,
+        )
+
+    jobs = [json.loads(line) for line in res.splitlines() if line]
+    fod = next(job for job in jobs if job["attr"] == "fod")
+    assert fod["cacheStatus"] == "cached", fod

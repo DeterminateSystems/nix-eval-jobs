@@ -5,8 +5,18 @@ project(
   license: 'GPL-3.0',
   default_options: [
     'cpp_std=c++20',
-    'warning_level=3'
+    'warning_level=3',
+    'unity=on',
+    'unity_size=999'
   ]
+)
+
+cpp = meson.get_compiler('cpp')
+# Unity builds merge translation units, so coroutine frames embed
+# lambda types with no linkage; harmless, but GCC warns about it.
+add_project_arguments(
+  cpp.get_supported_arguments('-Wno-subobject-linkage'),
+  language: 'cpp',
 )
 
 threads_dep = dependency('threads', required: true)

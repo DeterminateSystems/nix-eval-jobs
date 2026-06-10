@@ -10,6 +10,8 @@
 #include <nix/util/configuration.hh>
 #include <nix/util/types.hh>
 
+#include "daemon-settings.hh"
+
 namespace {
 
 struct DaemonSettings : nix::Config {
@@ -32,10 +34,18 @@ struct DaemonSettings : nix::Config {
         )"};
 };
 
-DaemonSettings
-    daemonSettings; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
-// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
-nix::GlobalConfig::Register rDaemonSettings(&daemonSettings);
-
 } // namespace
+
+namespace nix_eval_jobs {
+
+void registerDaemonSettings() {
+    // These must live for the process lifetime because GlobalConfig stores
+    // pointers to registered settings.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+    static DaemonSettings daemonSettings;
+    // NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
+    static nix::GlobalConfig::Register const rDaemonSettings(&daemonSettings);
+    static_cast<void>(rDaemonSettings);
+}
+
+} // namespace nix_eval_jobs
