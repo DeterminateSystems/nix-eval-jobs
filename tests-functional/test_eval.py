@@ -48,23 +48,21 @@ def common_test(extra_args: list[str]) -> list[dict[str, Any]]:
         results = [json.loads(r) for r in res.stdout.split("\n") if r]
         assert len(results) == 4
 
-        built_job = results[0]
-        assert built_job["attr"] == "builtJob"
+        by_attr = {r["attr"]: r for r in results}
+
+        built_job = by_attr["builtJob"]
         assert built_job["name"] == "job1"
         assert built_job["outputs"]["out"].endswith("-job1")
         assert built_job["drvPath"].endswith(".drv")
         # No meta field in bare derivations
 
-        dotted_job = results[1]
-        assert dotted_job["attr"] == '"dotted.attr"'
+        dotted_job = by_attr['"dotted.attr"']
         assert dotted_job["attrPath"] == ["dotted.attr"]
 
-        package_with_deps = results[2]
-        assert package_with_deps["attr"] == "package-with-deps"
+        package_with_deps = by_attr["package-with-deps"]
         assert package_with_deps["name"] == "package-with-deps"
 
-        recurse_drv = results[3]
-        assert recurse_drv["attr"] == "recurse.drvB"
+        recurse_drv = by_attr["recurse.drvB"]
         assert recurse_drv["name"] == "drvB"
 
         assert len(list(Path(tempdir).iterdir())) == 4

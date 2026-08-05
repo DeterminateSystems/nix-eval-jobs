@@ -7,6 +7,7 @@ common_src = [
   'worker.cc',
   'strings-portable.cc',
   'output-stream-lock.cc',
+  'cache-status-resolver.cc',
   'daemon-settings.cc'
 ]
 

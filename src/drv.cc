@@ -32,7 +32,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <algorithm>
 
 #include "drv.hh"
 #include "eval-args.hh"
@@ -107,122 +106,6 @@ auto queryInputDrvs(const nix::Derivation &drv)
     return drvs;
 }
 
-// queryMissing's per-input traversal flags an FOD as willBuild whenever a
-// build-time-only input is missing from substituters, even though `nix build`
-// would just download the FOD's own output. Returns Local/Cached when every
-// output is already obtainable; nullopt means the caller should fall through
-// to queryMissing so its per-input breakdown still populates neededBuilds for
-// cross-system jobs (issue #369).
-auto checkOutputsAvailable(
-    nix::Store &store,
-    std::map<std::string, std::optional<nix::StorePath>> &outputs,
-    std::vector<nix::StorePath> &neededSubstitutes)
-    -> std::optional<Drv::CacheStatus> {
-    nix::StorePathCAMap toQuery;
-    for (auto const &[outputName, outputPath] : outputs) {
-        if (!outputPath) {
-            return std::nullopt;
-        }
-        if (!store.isValidPath(*outputPath)) {
-            toQuery.insert({*outputPath, std::nullopt});
-        }
-    }
-    nix::SubstitutablePathInfos infos;
-    if (!toQuery.empty()) {
-        store.querySubstitutablePathInfos(toQuery, infos);
-    }
-    if (infos.size() != toQuery.size()) {
-        return std::nullopt;
-    }
-    for (auto const &[path, info] : infos) {
-        neededSubstitutes.push_back(path);
-    }
-    std::ranges::sort(
-        neededSubstitutes,
-        [](const nix::StorePath &lhs, const nix::StorePath &rhs) -> bool {
-            return lhs.name() != rhs.name() ? lhs.name() < rhs.name()
-                                            : lhs.to_string() < rhs.to_string();
-        });
-    return infos.empty() ? Drv::CacheStatus::Local : Drv::CacheStatus::Cached;
-}
-
-auto queryCacheStatus(
-    nix::Store &store,
-    std::map<std::string, std::optional<nix::StorePath>> &outputs,
-    nix::StorePaths &neededBuilds,
-    std::vector<nix::StorePath> &neededSubstitutes,
-    std::vector<nix::StorePath> &unknownPaths, const nix::Derivation &drv)
-    -> Drv::CacheStatus {
-
-    if (auto cached =
-            checkOutputsAvailable(store, outputs, neededSubstitutes)) {
-        return *cached;
-    }
-
-    std::vector<nix::StorePathWithOutputs> paths;
-    for (auto const &[key, val] : outputs) {
-        if (val) {
-            paths.push_back(nix::StorePathWithOutputs{*val, {}});
-        }
-    }
-    // Input drvs go in too so neededBuilds is populated for cross-system jobs
-    // whose own output paths are unknown (issue #369).
-    for (const auto &[inputDrvPath, inputNode] : drv.inputDrvs.map) {
-        paths.push_back(
-            nix::StorePathWithOutputs(inputDrvPath, inputNode.value));
-    }
-
-    auto missing = store.queryMissing(toDerivedPaths(paths));
-
-    if (!missing.willBuild.empty()) {
-        // TODO: can we expose the topological sort order as a graph?
-        auto sorted = store.topoSortPaths(missing.willBuild);
-        std::ranges::reverse(sorted.begin(), sorted.end());
-        for (auto &path : sorted) {
-            neededBuilds.push_back(std::move(path));
-        }
-    }
-    if (!missing.willSubstitute.empty()) {
-        std::vector<const nix::StorePath *> willSubstituteSorted = {};
-        std::ranges::for_each(missing.willSubstitute.begin(),
-                              missing.willSubstitute.end(),
-                              [&](const nix::StorePath &path) -> void {
-                                  willSubstituteSorted.push_back(&path);
-                              });
-        std::ranges::sort(
-            willSubstituteSorted.begin(), willSubstituteSorted.end(),
-            [](const nix::StorePath *lhs, const nix::StorePath *rhs) -> bool {
-                if (lhs->name() == rhs->name()) {
-                    return lhs->to_string() < rhs->to_string();
-                }
-                return lhs->name() < rhs->name();
-            });
-        for (const auto *path : willSubstituteSorted) {
-            neededSubstitutes.push_back(*path);
-        }
-    }
-
-    if (!missing.unknown.empty()) {
-        for (const auto &path : missing.unknown) {
-            unknownPaths.push_back(path);
-        }
-    }
-
-    if (missing.willBuild.empty() && missing.unknown.empty()) {
-        if (missing.willSubstitute.empty()) {
-            // cacheStatus is Local if:
-            //  - there's nothing to build
-            //  - there's nothing to substitute
-            return Drv::CacheStatus::Local;
-        }
-        // cacheStatus is Cached if:
-        //  - there's nothing to build
-        //  - there are paths to substitute
-        return Drv::CacheStatus::Cached;
-    }
-    return Drv::CacheStatus::NotBuilt;
-};
-
 } // namespace
 
 /* The fields of a derivation that are printed in json form */
@@ -255,13 +138,6 @@ auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
 
         // Use the more precise system from the derivation
         result.system = drv.platform;
-
-        if (args.checkCacheStatus) {
-            // TODO: is this a bottleneck, where we should batch these queries?
-            result.cacheStatus = queryCacheStatus(
-                *store, result.outputs, result.neededBuilds,
-                result.neededSubstitutes, result.unknownPaths, drv);
-        }
 
         if (args.showInputDrvs) {
             result.inputDrvs = queryInputDrvs(drv);
