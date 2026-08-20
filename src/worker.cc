@@ -311,10 +311,13 @@ auto initializeRootValue(const nix::ref<nix::EvalState> &state,
 auto shouldRestart(const MyArgs &args) -> bool {
     struct rusage resourceUsage = {}; // NOLINT(misc-include-cleaner)
     getrusage(RUSAGE_SELF, &resourceUsage);
-    const size_t maxrss =
+    size_t maxrss =
         resourceUsage
             .ru_maxrss; // NOLINT(cppcoreguidelines-pro-type-union-access)
     static constexpr size_t KB_TO_BYTES = 1024;
+#ifdef __APPLE__
+    maxrss /= KB_TO_BYTES; // ru_maxrss is bytes on macOS instead of KiB
+#endif
     return maxrss > args.maxMemorySize * KB_TO_BYTES;
 }
 
