@@ -21,7 +21,10 @@ add_project_arguments(
 
 threads_dep = dependency('threads', required: true)
 nlohmann_json_dep = dependency('nlohmann_json', required: true)
+boost_dep = dependency('boost', required: true)
 libcurl_dep = dependency('libcurl', required: true)
+# Same allocator as the nix binary. Listed first so it overrides malloc.
+mimalloc_dep = dependency('mimalloc', required: true)
 
 nix_store_dep = dependency('nix-store', required: true)
 nix_fetchers_dep = dependency('nix-fetchers', required: true)

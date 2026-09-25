@@ -6,7 +6,7 @@
 }:
 
 let
-  revision = "0";
+  revision = "4";
 in
 stdenv.mkDerivation {
   pname = "nix-eval-jobs";
@@ -29,7 +29,9 @@ stdenv.mkDerivation {
     nixComponents.nix-util-test-support
   ];
   buildInputs = with pkgs; [
+    mimalloc
     nlohmann_json
+    boost
     curl
     nixComponents.nix-store
     nixComponents.nix-fetchers

@@ -2,8 +2,8 @@
 
 This project evaluates nix attribute sets in parallel with streamable json
 output. This is useful for time and memory intensive evaluations such as NixOS
-machines, i.e. in a CI context. The evaluation is done with a controllable
-number of threads that are restarted when their memory consumption exceeds a
+machines, i.e. in a CI context. The evaluation is done by a controllable number
+of worker processes that are restarted when their memory consumption exceeds a
 certain threshold.
 
 To facilitate integration, nix-eval-jobs creates garbage collection roots for
@@ -13,7 +13,7 @@ service and user-started nix builds processes.
 
 ## Why using nix-eval-jobs?
 
-- Faster evaluation by using threads
+- Faster evaluation by using multiple worker processes
 - Memory used for evaluation is reclaimed after nix-eval-jobs finish, so that
   the build can use it.
 - Evaluation of jobs can fail individually
@@ -68,7 +68,7 @@ USAGE: nix-eval-jobs [options] expr
   Paths added through `-I` take precedence over the [`nix-path` configuration setting](@docroot@/command-ref/conf-file.md#conf-nix-path) and the [`NIX_PATH` environment variable](@docroot@/command-ref/env-common.md#env-NIX_PATH).
 
   --log-format           Set the format of log output; one of `raw`, `internal-json`, `bar` or `bar-with-logs`.
-  --max-memory-size      maximum evaluation memory size in megabyte (4GiB per worker by default)
+  --max-memory-size      memory per worker in MiB (4GiB by default). workers * max-memory-size is enforced as a budget for all workers combined: jobs are only dispatched while it has room, a worker above its share is restarted after its job, and if the budget is exceeded anyway the largest worker is killed and its job retried alone.
   --meta                 include derivation meta field in output
   --no-instantiate       don't instantiate (write) derivations, only evaluate (faster)
   --option               Set the Nix configuration setting *name* to *value* (overriding `nix.conf`).
@@ -107,8 +107,8 @@ we collect example ci configuration for various CIs.
 - [nix-fast-build](https://github.com/Mic92/nix-fast-build) - Combine the power
   of nix-eval-jobs with nix-output-monitor to speed-up your evaluation and
   building process
-- [buildbot-nix](https://github.com/Mic92/buildbot-nix) - A nixos module to make
-  buildbot a proper Nix-CI
+- [nixbot](https://github.com/Mic92/nixbot) - Standalone Nix CI service for
+  NixOS
 - [colmena](https://github.com/zhaofengli/colmena) - A simple, stateless NixOS
   deployment tool
 - [robotnix](https://github.com/danielfullmer/robotnix) - Build Android (AOSP)
@@ -128,6 +128,23 @@ If you provide the `--check-cache-status`, the json will contain a
 | cached   | Package is present in the binary cache, but not locally |
 | notBuilt | Package needs to be built.                              |
 
+### Where do evaluation warnings and traces end up?
+
+Messages from `builtins.warn` and `builtins.trace` are printed to stderr as
+usual and additionally attached to the JSON line of the attribute that was being
+evaluated, as `"warnings": [...]` and `"traces": [...]` (omitted when empty).
+Because Nix evaluates shared values only once, a message from code shared
+between attributes is reported on whichever attribute forced it first.
+
+### How expensive was an attribute to evaluate?
+
+Every JSON line carries `"stats": {"wallMs": ..., "allocBytes": ...}` with the
+wall-clock time and the number of bytes allocated on the GC heap while the
+worker evaluated that attribute. As with warnings, values shared between
+attributes are only evaluated once and are billed to whichever attribute forced
+them first, so the numbers depend on scheduling order and are best used to spot
+outliers rather than for exact accounting.
+
 ### How can I evaluate nixpkgs?
 
 If you want to evaluate nixpkgs in the same way
@@ -139,27 +156,33 @@ $ nix-eval-jobs --force-recurse pkgs/top-level/release.nix
 
 ### nix-eval-jobs consumes too much memory / is too slow
 
-By default, nix-eval-jobs spawns one worker process and limits the memory usage
-for each worker to 4GB.
+By default nix-eval-jobs spawns one worker with `--max-memory-size` 4096 MiB.
+Workers keep their evaluation cache between attributes, so more memory per
+worker means fewer restarts and less re-evaluation of shared dependencies. More
+`--workers` means more parallelism but also more duplicated evaluation.
 
-When using multiple workers, keep in mind that each worker process may need to
-re-evaluate shared dependencies of the attributes, which can introduce some
-overhead for each evaluation or cause workers to exceed their memory limit. You
-can tune the following options:
+`workers * max-memory-size` is treated as one budget for all workers combined,
+so you can size it to the memory you actually want to give the run (e.g. a
+cgroup limit):
 
-`--workers`: This option allows you to set the number of evaluation workers that
-nix-eval-jobs should spawn. You can increase or decrease this number to optimize
-the evaluation speed and memory usage. For example, if you have a system with
-many CPU cores but limited memory, you may want to reduce the number of workers
-to avoid exceeding the memory limit.
+- A worker whose RSS exceeds its share is restarted after finishing its current
+  attribute.
+- New attributes are only dispatched while the total RSS plus the estimated
+  growth of all in-flight jobs fits the budget, so a few large attributes (e.g.
+  NixOS closures) throttle concurrency instead of overshooting.
+- If the budget is exceeded anyway, the largest worker is killed and its
+  attribute is retried alone on a fresh worker; only if it still does not fit is
+  it reported as an error for that attribute. A worker killed externally (e.g.
+  by the kernel OOM killer) is handled the same way.
 
-`--max-memory-size`: This option allows you to adjust the memory limit for each
-worker process. By default, it's set to 4GiB, but you can increase or decrease
-this value as needed. For example, if you have a system with a lot of memory and
-want to speed up the evaluation, you may want to increase the memory limit to
-allow workers to cache more data in memory before getting restarted by
-nix-eval-jobs. Note that this is not a hard limit and memory usage may rise
-above the limit momentarily before the worker process exits.
+Rule of thumb: set `--workers` to the cores you want to use and
+`--max-memory-size` to `available memory / workers`. If single attributes are
+larger than one share, prefer fewer workers with a larger `--max-memory-size`
+over many small ones.
 
-Overall, tuning these options can help you optimize the performance and memory
-usage of nix-eval-jobs to better fit your system and evaluation needs.
+## Making a release
+
+Versions follow `<nix major.minor>.<revision>`. From an up-to-date `main` run
+`./dev/create-release.sh` (or `./dev/create-release.sh 0` after bumping Nix). It
+bumps `revision` in `default.nix`, merges it via PR, tags and publishes the
+GitHub release.

@@ -1,4 +1,7 @@
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cctype>
+#include <string_view>
 #include <nix/util/json-utils.hh>
 #include <nix/util/util.hh> // for overloaded
 #include <nlohmann/json_fwd.hpp>
@@ -12,12 +15,54 @@
 #include "response.hh"
 #include "drv.hh"
 
+namespace {
+auto isPlainIdentifier(std::string_view s) -> bool {
+    if (s.empty()) {
+        return false;
+    }
+    auto first = static_cast<unsigned char>(s.front());
+    if (!(std::isalpha(first) || first == '_')) {
+        return false;
+    }
+    return std::ranges::all_of(s, [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == '\'' || c == '-';
+    });
+}
+} // namespace
+
+/* Quoted like Nix prints attribute names. Never parsed back. */
+auto joinAttrPath(const nlohmann::json &attrPath) -> std::string {
+    std::string joined;
+    bool first = true;
+    for (const auto &element : attrPath) {
+        const auto part = element.get<std::string>();
+        if (!first) {
+            joined += '.';
+        }
+        first = false;
+        if (isPlainIdentifier(part)) {
+            joined += part;
+            continue;
+        }
+        joined += '"';
+        for (const char c : part) {
+            if (c == '"' || c == '\\' || c == '$') {
+                joined += '\\';
+            }
+            joined += c;
+        }
+        joined += '"';
+    }
+    return joined;
+}
+
 namespace nlohmann {
 
 using nix::get;
 using nix::getBoolean;
 using nix::getObject;
 using nix::getString;
+using nix::getUnsigned;
 using nix::overloaded;
 using nix::valueAt;
 
@@ -26,6 +71,18 @@ void adl_serializer<Response>::to_json(json &res, const Response &response) {
         {"attr", response.attr},
         {"attrPath", response.attrPath},
     };
+    if (!response.warnings.empty()) {
+        res["warnings"] = response.warnings;
+    }
+    if (!response.traces.empty()) {
+        res["traces"] = response.traces;
+    }
+    if (response.stats) {
+        res["stats"] = json{
+            {"wallMs", response.stats->wallMs},
+            {"allocBytes", response.stats->allocBytes},
+        };
+    }
 
     std::visit(overloaded{
                    [&](const Response::Job &job) -> void {
@@ -52,11 +109,26 @@ auto adl_serializer<Response>::from_json(const json &_json) -> Response {
     auto attr = getString(valueAt(json, "attr"));
     std::vector<std::string> attrPath = valueAt(json, "attrPath");
 
+    auto stringList = [&](const char *key) -> std::vector<std::string> {
+        const auto *v = get(json, key);
+        return v ? v->get<std::vector<std::string>>()
+                 : std::vector<std::string>{};
+    };
+    std::optional<Response::Stats> stats;
+    if (const auto *s = get(json, "stats")) {
+        stats = Response::Stats{
+            .wallMs = getUnsigned(valueAt(getObject(*s), "wallMs")),
+            .allocBytes = getUnsigned(valueAt(getObject(*s), "allocBytes")),
+        };
+    }
     auto makeResponse = [&](Response::Payload payload) -> Response {
         return Response{
             .attr = std::move(attr),
             .attrPath = std::move(attrPath),
             .payload = std::move(payload),
+            .warnings = stringList("warnings"),
+            .traces = stringList("traces"),
+            .stats = stats,
         };
     };
 
