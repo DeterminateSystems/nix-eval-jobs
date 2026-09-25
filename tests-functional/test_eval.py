@@ -851,6 +851,14 @@ def test_fod_with_uncached_input_issue413(tmp_path: Path, scheme: str) -> None:
     assert fod["cacheStatus"] == "cached", fod
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "IFD builds the derivation in-process; on macOS Nix still configures "
+        "a sandbox-exec profile even with sandbox=false, which cannot be "
+        "nested inside the functional-tests build sandbox"
+    ),
+)
 def test_ifd_with_separate_eval_store(tmp_path: Path) -> None:
     """IFD must build in --store, not in a (possibly unbuildable) --eval-store."""
     env = _hermetic_nix_env(tmp_path)
