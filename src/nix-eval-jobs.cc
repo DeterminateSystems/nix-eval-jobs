@@ -1,19 +1,14 @@
-// NOLINTBEGIN(modernize-deprecated-headers)
-// misc-include-cleaner wants these header rather than the C++ versions
-#include <signal.h>
+// NOLINTNEXTLINE(modernize-deprecated-headers) misc-include-cleaner wants this
+// for setenv
 #include <stdlib.h>
-#include <string.h>
-// NOLINTEND(modernize-deprecated-headers)
-#include <cassert>
+#include <chrono>
+#include <algorithm>
 #include <cerrno>
-#include <condition_variable>
 #include <csignal>
+#include <poll.h>
 #include <cstdlib>
-#include <cstring>
-#include <curl/curl.h>
 #include <exception>
 #include <filesystem>
-#include <functional>
 #include <map>
 #include <memory>
 #include <nix/cmd/common-eval-args.hh>
@@ -25,71 +20,77 @@
 #include <nix/flake/settings.hh>
 #include <nix/main/shared.hh>
 #include <nix/store/globals.hh>
-#include <nix/store/local-fs-store.hh>
 #include <nix/util/configuration.hh>
 #include <nix/util/error.hh>
-#include <nix/util/file-descriptor.hh>
 #include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
-#include <nix/util/processes.hh>
 #include <nix/util/signals.hh> // NOLINT(misc-header-include-cycle)
 #include <nix/util/sync.hh>
 #include <nix/util/terminal.hh>
-#include <nix/util/util.hh>
 #ifdef __linux__
 #include <nix/util/linux-namespaces.hh>
 #include <nix/util/users.hh>
 #endif
-#include <sys/signal.h>
-#include <variant>
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
-#include <pthread.h>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "eval-args.hh"
 #include "buffered-io.hh"
 #include "worker.hh"
 #include "response.hh"
-#include "strings-portable.hh"
 #include "output-stream-lock.hh"
 #include "constituents.hh"
 #include "daemon-settings.hh"
+#include "crash-handler.hh"
 #include "store.hh"
 #include "cache-status-resolver.hh"
+#include "rss.hh"
+#include "proc.hh"
 
 namespace {
 MyArgs myArgs; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-using Processor = std::function<void(MyArgs &myArgs, nix::AutoCloseFD &toFd,
-                                     nix::AutoCloseFD &fromFd)>;
+void runWorker() {
+    nix::AutoCloseFD toParent(WORKER_OUT_FD);
+    nix::AutoCloseFD fromParent(WORKER_IN_FD);
+    nix::logger->log(nix::lvlDebug,
+                     nix::fmt("created worker process %d", getpid()));
+    try {
+        worker(myArgs, toParent, fromParent);
+    } catch (nix::Error &e) {
+        nlohmann::json err;
+        const auto &msg = e.msg();
+        err["error"] = nix::filterANSIEscapes(msg, true);
+        // Also print it to the STDERR log; this is what's shown in
+        // the Hydra UI.
+        nix::logger->log(nix::lvlError, msg);
+        if (tryWriteLine(toParent.get(), err.dump()) < 0) {
+            return; // main process died
+        }
+        if (tryWriteLine(toParent.get(), std::string(MSG_RESTART)) < 0) {
+            return; // main process died
+        }
+    }
+}
 
 void handleConstituents(std::map<std::string, nlohmann::json> &jobs,
                         const MyArgs &args) {
 
     auto store = nix_eval_jobs::openStore(args.evalStoreUrl);
-    auto localStore = store.dynamic_pointer_cast<nix::LocalFSStore>();
-
-    if (!localStore) {
-        nix::warn("constituents feature requires a local store, skipping "
-                  "aggregate rewriting");
-        return;
-    }
-
-    auto localStoreRef = nix::ref<nix::LocalFSStore>(localStore);
 
     std::visit(
         nix::overloaded{
             [&](const std::vector<AggregateJob> &namedConstituents) -> void {
-                rewriteAggregates(jobs, namedConstituents, localStoreRef,
+                rewriteAggregates(jobs, namedConstituents, store,
                                   args.gcRootsDir);
             },
             [&](const DependencyCycle &cycle) -> void {
@@ -114,261 +115,14 @@ void handleConstituents(std::map<std::string, nlohmann::json> &jobs,
         resolveNamedConstituents(jobs));
 }
 
-/* Auto-cleanup of fork's process and fds. */
-struct Proc {
-    nix::AutoCloseFD to, from;
-    nix::Pid pid;
+using JobMap = std::map<std::string, nlohmann::json>;
 
-    Proc(const Proc &) = delete;
-    Proc(Proc &&) = delete;
-    auto operator=(const Proc &) -> Proc & = delete;
-    auto operator=(Proc &&) -> Proc & = delete;
-
-    explicit Proc(const Processor &proc) {
-        nix::Pipe toPipe;
-        nix::Pipe fromPipe;
-        toPipe.create();
-        fromPipe.create();
-        auto childPid = startProcess(
-            [&,
-             toFd{std::make_shared<nix::AutoCloseFD>(
-                 std::move(fromPipe.writeSide))},
-             fromFd{std::make_shared<nix::AutoCloseFD>(
-                 std::move(toPipe.readSide))}]() -> void {
-                nix::logger->log(
-                    nix::lvlDebug,
-                    nix::fmt("created worker process %d", getpid()));
-                try {
-                    proc(myArgs, *toFd, *fromFd);
-                } catch (nix::Error &e) {
-                    nlohmann::json err;
-                    const auto &msg = e.msg();
-                    err["error"] = nix::filterANSIEscapes(msg, true);
-                    nix::logger->log(nix::lvlError, msg);
-                    if (tryWriteLine(toFd->get(), err.dump()) < 0) {
-                        return; // main process died
-                    };
-                    // Don't forget to print it into the STDERR log, this is
-                    // what's shown in the Hydra UI.
-                    if (tryWriteLine(toFd->get(), "restart") < 0) {
-                        return; // main process died
-                    }
-                }
-            },
-            nix::ProcessOptions{.allowVfork = false});
-
-        to = std::move(toPipe.writeSide);
-        from = std::move(fromPipe.readSide);
-        pid = childPid;
-    }
-
-    ~Proc() = default;
-};
-
-// We'd highly prefer using std::thread here; but this won't let us configure
-// the stack size. macOS uses 512KiB size stacks for non-main threads, and musl
-// defaults to 128k. While Nix configures a 64MiB size for the main thread, this
-// doesn't propagate to the threads we launch here. It turns out, running the
-// evaluator under an anemic stack of 0.5MiB has it overflow way too quickly.
-// Hence, we have our own custom Thread struct.
-// NOLINTBEGIN(misc-include-cleaner)
-// False positive: pthread.h is included but clang-tidy doesn't recognize it
-struct Thread {
-    pthread_t thread = {};
-
-    Thread(const Thread &) = delete;
-    Thread(Thread &&) noexcept = default;
-    ~Thread() = default;
-    auto operator=(const Thread &) -> Thread & = delete;
-    auto operator=(Thread &&) -> Thread & = delete;
-
-    explicit Thread(std::function<void(void)> func) {
-        pthread_attr_t attr = {};
-
-        auto funcPtr =
-            std::make_unique<std::function<void(void)>>(std::move(func));
-
-        int status = pthread_attr_init(&attr);
-        if (status != 0) {
-            throw nix::SysError(status, "calling pthread_attr_init");
-        }
-
-        struct AttrGuard {
-            pthread_attr_t &attr;
-            explicit AttrGuard(pthread_attr_t &attribute) : attr(attribute) {}
-            AttrGuard(const AttrGuard &) = delete;
-            auto operator=(const AttrGuard &) -> AttrGuard & = delete;
-            AttrGuard(AttrGuard &&) = delete;
-            auto operator=(AttrGuard &&) -> AttrGuard & = delete;
-            ~AttrGuard() { (void)pthread_attr_destroy(&attr); }
-        };
-        const AttrGuard attrGuard(attr);
-
-        static constexpr size_t STACK_SIZE_MB = 64;
-        static constexpr size_t KB_SIZE = 1024;
-        status = pthread_attr_setstacksize(
-            &attr, static_cast<size_t>(STACK_SIZE_MB) * KB_SIZE * KB_SIZE);
-        if (status != 0) {
-            throw nix::SysError(status, "calling pthread_attr_setstacksize");
-        }
-        status = pthread_create(&thread, &attr, Thread::init, funcPtr.get());
-        if (status != 0) {
-            throw nix::SysError(status, "calling pthread_launch");
-        }
-        [[maybe_unused]] auto *res =
-            funcPtr.release(); // will be deleted in init()
-    }
-
-    void join() const {
-        const int status = pthread_join(thread, nullptr);
-        if (status != 0) {
-            throw nix::SysError(status, "calling pthread_join");
-        }
-    }
-
-  private:
-    static auto init(void *ptr) -> void * {
-        std::unique_ptr<std::function<void(void)>> func;
-        func.reset(static_cast<std::function<void(void)> *>(ptr));
-
-        (*func)();
-        return nullptr;
-    }
-};
-// NOLINTEND(misc-include-cleaner)
-
-struct State {
-    std::set<nlohmann::json> todo =
-        nlohmann::json::array({nlohmann::json::array()});
-    std::set<nlohmann::json> active;
-    std::map<std::string, nlohmann::json> jobs;
-    std::exception_ptr exc;
-};
-
-void handleBrokenWorkerPipe(Proc &proc, std::string_view msg) {
-    // we already took the process status from Proc, no
-    // need to wait for it again to avoid error messages
-    // NOLINTNEXTLINE(misc-include-cleaner)
-    const pid_t pid = proc.pid.release();
-    while (true) {
-        int status = 0;
-        const int result = waitpid(pid, &status, WNOHANG);
-        if (result == 0) {
-            kill(pid, SIGKILL);
-            throw nix::Error(
-                "BUG: while %s, worker pipe got closed but evaluation "
-                "worker still running?",
-                msg);
-        }
-
-        if (result == -1) {
-            kill(pid, SIGKILL);
-            throw nix::Error(
-                "BUG: while %s, waitpid for evaluation worker failed: %s", msg,
-                get_error_name(errno));
-        }
-        if (WIFEXITED(status)) {
-            if (WEXITSTATUS(status) == 1) {
-                throw nix::Error(
-                    "while %s, evaluation worker exited with exit code 1, "
-                    "(possible infinite recursion)",
-                    msg);
-            }
-            throw nix::Error("while %s, evaluation worker exited with %d", msg,
-                             WEXITSTATUS(status));
-        }
-
-        if (WIFSIGNALED(status)) {
-            switch (WTERMSIG(status)) {
-            case SIGKILL:
-                throw nix::Error(
-                    "while %s, evaluation worker got killed by SIGKILL, "
-                    "maybe "
-                    "memory limit reached?",
-                    msg);
-                break;
-#ifdef __APPLE__
-            case SIGBUS:
-                throw nix::Error(
-                    "while %s, evaluation worker got killed by SIGBUS, "
-                    "(possible infinite recursion)",
-                    msg);
-                break;
-#else
-            case SIGSEGV:
-                throw nix::Error(
-                    "while %s, evaluation worker got killed by SIGSEGV, "
-                    "(possible infinite recursion)",
-                    msg);
-#endif
-            default:
-                throw nix::Error("while %s, evaluation worker got killed by "
-                                 "signal %d (%s)",
-                                 msg, WTERMSIG(status),
-                                 get_signal_name(WTERMSIG(status)));
-            }
-        } // else ignore WIFSTOPPED and WIFCONTINUED
-    }
-}
-
-auto joinAttrPath(const nlohmann::json &attrPath) -> std::string {
-    std::string joined;
-    for (const auto &element : attrPath) {
-        if (!joined.empty()) {
-            joined += '.';
-        }
-        joined += element.get<std::string>();
-    }
-    return joined;
-}
-
-namespace {
-auto checkWorkerStatus(LineReader *fromReader, Proc *proc) -> std::string_view {
-    auto line = fromReader->readLine();
-    if (line.empty()) {
-        handleBrokenWorkerPipe(*proc, "checking worker process");
-    }
-    if (line != "next" && line != "restart") {
-        try {
-            auto json = nlohmann::json::parse(line);
-            throw nix::Error("worker error: %s", std::string(json["error"]));
-        } catch (const nlohmann::json::exception &e) {
-            throw nix::Error(
-                "Received invalid JSON from worker: %s\n json: '%s'", e.what(),
-                line);
-        }
-    }
-    return line;
-}
-
-auto getNextJob(nix::Sync<State> &state_, std::condition_variable &wakeup)
-    -> std::optional<nlohmann::json> {
-    nlohmann::json attrPath;
-    while (true) {
-        nix::checkInterrupt();
-        auto state(state_.lock());
-        if ((state->todo.empty() && state->active.empty()) || state->exc) {
-            return std::nullopt;
-        }
-        if (!state->todo.empty()) {
-            attrPath = *state->todo.begin();
-            state->todo.erase(state->todo.begin());
-            state->active.insert(attrPath);
-            return attrPath;
-        }
-        state.wait(wakeup);
-    }
-}
-
-/* Record a finished job/error in the shared state and print it,
-   unless it is an aggregate that still awaits its constituents (then
-   handleConstituents prints it later). */
-void emitResponse(nix::Sync<State> &state_, const Response &response,
-                  nlohmann::json jsonResponse, std::string_view dumped) {
-    {
-        auto state(state_.lock());
-        state->jobs.insert_or_assign(response.attr, std::move(jsonResponse));
-    }
+/* Record a finished job/error and print it, unless it is an aggregate
+   that still awaits its constituents (handleConstituents prints it
+   later). Also called from the CacheStatusResolver thread. */
+void emitResponse(nix::Sync<JobMap> &jobs, const Response &response,
+                  nlohmann::json json, std::string_view dumped) {
+    jobs.lock()->insert_or_assign(response.attr, std::move(json));
 
     bool hasPendingConstituents = false;
     if (const auto *job = std::get_if<Response::Job>(&response.payload)) {
@@ -380,129 +134,395 @@ void emitResponse(nix::Sync<State> &state_, const Response &response,
     }
 }
 
-auto processWorkerResponse(LineReader *fromReader,
-                           const nlohmann::json &attrPath, Proc *proc,
-                           nix::Sync<State> &state_,
-                           CacheStatusResolver *cacheStatusResolver)
-    -> std::vector<nlohmann::json> {
-    // Read response from worker
-    auto respString = fromReader->readLine();
-    if (respString.empty()) {
-        auto msg =
-            "reading result for attrPath '" + joinAttrPath(attrPath) + "'";
-        handleBrokenWorkerPipe(*proc, msg);
-    }
+void emitResponse(nix::Sync<JobMap> &jobs, const Response &response) {
+    nlohmann::json json = response;
+    auto dumped = json.dump();
+    emitResponse(jobs, response, std::move(json), dumped);
+}
 
-    // Parse and deserialize the typed response
-    nlohmann::json jsonResponse;
+void emitError(nix::Sync<JobMap> &jobs, const nlohmann::json &attrPath,
+               const std::string &msg) {
+    const Response response{
+        .attr = joinAttrPath(attrPath),
+        .attrPath = attrPath.get<std::vector<std::string>>(),
+        .payload = Response::Error{msg},
+    };
+    nix::logger->log(nix::lvlError, msg + ": " + response.attr);
+    emitResponse(jobs, response);
+}
+
+auto parseResponse(std::string_view line)
+    -> std::pair<Response, nlohmann::json> {
     try {
-        jsonResponse = nlohmann::json::parse(respString);
+        auto json = nlohmann::json::parse(line);
+        auto response = json.get<Response>();
+        return {std::move(response), std::move(json)};
     } catch (const nlohmann::json::exception &e) {
         throw nix::Error("Received invalid JSON from worker: %s\n json: '%s'",
-                         e.what(), respString);
+                         e.what(), line);
     }
-    auto response = jsonResponse.get<Response>();
-
-    // Dispatch on the response payload
-    std::vector<nlohmann::json> newAttrs;
-    if (auto *attrs = std::get_if<Response::Attrs>(&response.payload)) {
-        for (const auto &attr : attrs->attrs) {
-            nlohmann::json newAttr(response.attrPath);
-            newAttr.emplace_back(attr);
-            newAttrs.push_back(newAttr);
-        }
-    } else if ((cacheStatusResolver != nullptr) &&
-               std::holds_alternative<Response::Job>(response.payload)) {
-        // The resolver fills in cacheStatus, then records/prints the job
-        // via its sink.
-        cacheStatusResolver->push(std::move(response));
-    } else {
-        emitResponse(state_, response, std::move(jsonResponse), respString);
-
-        if (auto *error = std::get_if<Response::Error>(&response.payload);
-            (error != nullptr) && error->fatal) {
-            throw nix::Error("%s", error->error);
-        }
-    }
-
-    return newAttrs;
 }
 
-void updateJobQueue(nix::Sync<State> &state_, std::condition_variable &wakeup,
-                    const nlohmann::json &attrPath,
-                    const std::vector<nlohmann::json> &newAttrs) {
-    auto state(state_.lock());
-    state->active.erase(attrPath);
-    for (const auto &newAttr : newAttrs) {
-        state->todo.insert(newAttr);
+/* Single-threaded event loop over the worker pipes: spawns workers,
+   hands out jobs and collects results.
+
+   Memory: workers * max-memory-size is one budget for all workers. A
+   job is only dispatched while every running job plus the new one can
+   still grow by `estimate` (decayed max of observed job RSS growth)
+   within the budget. If the budget is exceeded anyway the largest busy
+   worker is SIGKILLed and its job queued for Mode::Solo: all workers are
+   torn down and a single fresh one retries it. Sizes in MiB. */
+class Scheduler {
+  public:
+    Scheduler(const MyArgs &args, const WorkerSpawnConfig &spawn,
+              CacheStatusResolver *cacheStatusResolver, nix::Sync<JobMap> &jobs)
+        : spawn(spawn), cacheStatusResolver(cacheStatusResolver), jobs(jobs),
+          budget(args.nrWorkers * args.maxMemorySize), workers(args.nrWorkers) {
+        todo.insert(nlohmann::json::array());
     }
-    wakeup.notify_all();
-}
-} // namespace
+
+    void run() {
+        while (!finished() || anyWorkerAlive()) {
+            nix::checkInterrupt();
+            dispatch();
+            pollWorkers();
+        }
+    }
+
+  private:
+    /* Killed: we SIGKILLed it for exceeding the budget, EOF pending. */
+    enum class Phase { None, Starting, Idle, Busy, Killed, Exiting };
+    enum class Mode { Parallel, Solo };
+    struct Worker {
+        std::unique_ptr<Proc> proc;
+        Phase phase = Phase::None;
+        nlohmann::json attrPath;
+        size_t rss = 0;
+        size_t startRss = 0;
+
+        [[nodiscard]] auto running() const -> bool {
+            return phase == Phase::Busy || phase == Phase::Killed;
+        }
+
+        void sampleRss() { rss = proc ? residentMemoryMiB(proc->pid()) : 0; }
+        [[nodiscard]] auto growth() const -> size_t {
+            return rss > startRss ? rss - startRss : 0;
+        }
+    };
+
+    static constexpr auto SAMPLE_INTERVAL = std::chrono::milliseconds(200);
+    static constexpr size_t INITIAL_ESTIMATE = 512;
+    static constexpr size_t DECAY_PERCENT = 98;
+
+    const WorkerSpawnConfig &spawn;
+    CacheStatusResolver *cacheStatusResolver;
+    nix::Sync<JobMap> &jobs;
+
+    std::set<nlohmann::json> todo;
+    std::vector<nlohmann::json> solo;
+    Mode mode = Mode::Parallel;
+    const size_t budget;
+    size_t estimate = INITIAL_ESTIMATE;
+    std::vector<Worker> workers;
+    std::chrono::steady_clock::time_point lastSample;
+
+    [[nodiscard]] auto running() const -> size_t {
+        return static_cast<size_t>(std::ranges::count_if(
+            workers, [](const Worker &w) -> bool { return w.running(); }));
+    }
+
+    [[nodiscard]] auto finished() const -> bool {
+        return todo.empty() && solo.empty() && running() == 0;
+    }
+
+    [[nodiscard]] auto totalRss() const -> size_t {
+        size_t sum = residentMemoryMiB(getpid());
+        for (const auto &w : workers) {
+            sum += w.rss;
+        }
+        return sum;
+    }
+
+    [[nodiscard]] auto fitsBudget() const -> bool {
+        const size_t busy = count(Phase::Busy);
+        return busy == 0 || totalRss() + (busy + 1) * estimate <= budget;
+    }
+
+    [[nodiscard]] auto anyWorkerAlive() const -> bool {
+        return std::ranges::any_of(
+            workers, [](const Worker &w) -> bool { return w.proc != nullptr; });
+    }
+
+    [[nodiscard]] auto count(Phase phase) const -> size_t {
+        return static_cast<size_t>(
+            std::ranges::count_if(workers, [phase](const Worker &w) -> bool {
+                return w.phase == phase;
+            }));
+    }
+
+    auto takeJob(Worker &w) -> std::optional<nlohmann::json> {
+        if (running() > 0 && (mode == Mode::Solo || !solo.empty())) {
+            return std::nullopt; // one at a time / drain before Solo
+        }
+        std::optional<nlohmann::json> attrPath;
+        if (mode == Mode::Solo) {
+            attrPath = solo.back();
+            solo.pop_back();
+        } else if (solo.empty() && !todo.empty() && fitsBudget()) {
+            attrPath = *todo.begin();
+            todo.erase(todo.begin());
+        } else {
+            return std::nullopt;
+        }
+        w.startRss = w.rss;
+        return attrPath;
+    }
+
+    /* Each retry runs on one fresh worker with nobody else's heap
+       around: drop every worker, dispatch() spawns one, and Solo ends
+       with that job so the next retry starts over. */
+    void enterSolo() {
+        for (auto &w : workers) {
+            w = Worker{};
+        }
+        mode = Mode::Solo;
+    }
+
+    void resetWorker(size_t idx) { workers[idx] = Worker{}; }
+
+    void jobFinished(Worker &w) {
+        w.sampleRss();
+        estimate = std::max(estimate * DECAY_PERCENT / 100, w.growth());
+        w.phase = Phase::Starting;
+        w.attrPath = nullptr;
+        mode = Mode::Parallel;
+    }
+
+    void sampleMemory() {
+        for (auto &w : workers) {
+            w.sampleRss();
+            if (w.running()) {
+                estimate = std::max(estimate, w.growth());
+            }
+        }
+        const size_t total = totalRss();
+        if (total <= budget) {
+            return;
+        }
+        Worker *victim = nullptr;
+        for (auto &w : workers) {
+            if (w.phase == Phase::Busy &&
+                (victim == nullptr || w.rss > victim->rss)) {
+                victim = &w;
+            }
+        }
+        if (victim == nullptr) {
+            return;
+        }
+        nix::logger->log(
+            nix::lvlInfo,
+            nix::fmt("memory budget of %d MiB exceeded (%d MiB in use), "
+                     "killing worker %d ('%s', %d MiB)",
+                     budget, total, victim->proc->pid(),
+                     joinAttrPath(victim->attrPath), victim->rss));
+        victim->phase = Phase::Killed;
+        kill(victim->proc->pid(), SIGKILL);
+    }
+
+    void dispatch() {
+        /* Don't spawn more workers than there are jobs to hand out. In
+           Solo mode exactly one worker may exist at all. */
+        if (mode == Mode::Parallel && !solo.empty() && running() == 0) {
+            enterSolo();
+        }
+        size_t spawnable = 0;
+        if (mode == Mode::Solo) {
+            spawnable = anyWorkerAlive() ? 0 : 1;
+        } else if (solo.empty()) {
+            spawnable = todo.size();
+            spawnable -= std::min(spawnable,
+                                  count(Phase::Starting) + count(Phase::Idle));
+        }
+
+        for (size_t idx = 0; idx < workers.size(); idx++) {
+            Worker &w = workers[idx];
+            if (w.phase == Phase::Idle && finished()) {
+                (void)w.proc->sendLine(MSG_EXIT);
+                w.phase = Phase::Exiting;
+            } else if (w.phase == Phase::Idle) {
+                if (auto attrPath = takeJob(w)) {
+                    w.attrPath = std::move(*attrPath);
+                    w.phase = Phase::Busy;
+                    if (!w.proc->sendLine(std::string(MSG_DO) +
+                                          w.attrPath.dump())) {
+                        onEof(idx);
+                    }
+                }
+            } else if (w.phase == Phase::None && spawnable > 0 && !finished()) {
+                w.proc = std::make_unique<Proc>(spawn);
+                w.phase = Phase::Starting;
+                w.sampleRss();
+                spawnable--;
+            }
+        }
+    }
+
+    void pollWorkers() {
+        std::vector<pollfd> fds;
+        std::vector<size_t> owner;
+        fds.reserve(workers.size());
+        owner.reserve(workers.size());
+        for (size_t idx = 0; idx < workers.size(); idx++) {
+            if (workers[idx].proc) {
+                fds.push_back({.fd = workers[idx].proc->readFd(),
+                               .events = POLLIN,
+                               .revents = 0});
+                owner.push_back(idx);
+            }
+        }
+        constexpr auto timeoutMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                SAMPLE_INTERVAL)
+                .count();
+        static_assert(std::in_range<int>(timeoutMs));
+        const int n = poll(fds.data(), fds.size(), static_cast<int>(timeoutMs));
+        if (n == -1 && errno != EINTR) {
+            throw nix::SysError("polling workers");
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastSample >= SAMPLE_INTERVAL) {
+            sampleMemory();
+            lastSample = now;
+        }
+
+        for (size_t i = 0; i < fds.size(); i++) {
+            if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                readWorker(owner.at(i));
+            }
+        }
+    }
+
+    void readWorker(size_t idx) {
+        Worker &w = workers[idx];
+        const bool eof = !w.proc->fill();
+        while (w.proc) {
+            auto line = w.proc->popLine();
+            if (!line) {
+                break;
+            }
+            onLine(idx, *line);
+        }
+        if (eof && w.proc) {
+            onEof(idx);
+        }
+    }
+
+    void onLine(size_t idx, std::string_view line) {
+        switch (workers[idx].phase) {
+        case Phase::Starting:
+            if (line == MSG_NEXT) {
+                workers[idx].phase = Phase::Idle;
+            } else if (line == MSG_RESTART) {
+                resetWorker(idx);
+            } else {
+                auto json = nlohmann::json::parse(line, nullptr, false);
+                if (json.is_object()) {
+                    if (auto err = json.value("error", std::string{});
+                        !err.empty()) {
+                        throw nix::Error("worker error: %s", err);
+                    }
+                }
+                throw nix::Error("unexpected line from worker: '%s'", line);
+            }
+            break;
+        case Phase::Busy:
+            onResponse(idx, line);
+            break;
+        case Phase::Killed: // finished before the signal landed, retried anyway
+        case Phase::Exiting:
+            break;
+        default:
+            throw nix::Error("unexpected line from idle worker: '%s'", line);
+        }
+    }
+
+    void onResponse(size_t idx, std::string_view line) {
+        auto [response, json] = parseResponse(line);
+
+        if (auto *attrs = std::get_if<Response::Attrs>(&response.payload)) {
+            for (const auto &attr : attrs->attrs) {
+                nlohmann::json child(response.attrPath);
+                child.emplace_back(attr);
+                todo.insert(std::move(child));
+            }
+        } else if (cacheStatusResolver != nullptr &&
+                   std::holds_alternative<Response::Job>(response.payload)) {
+            // The resolver fills in cacheStatus and emits via its sink.
+            cacheStatusResolver->push(std::move(response));
+        } else {
+            emitResponse(jobs, response, std::move(json), line);
+            if (auto *error = std::get_if<Response::Error>(&response.payload);
+                error != nullptr && error->fatal) {
+                throw nix::Error("%s", error->error);
+            }
+        }
+
+        jobFinished(workers[idx]);
+    }
+
+    void onEof(size_t idx) {
+        Worker &w = workers[idx];
+        if (w.phase == Phase::Exiting) {
+            resetWorker(idx);
+            return;
+        }
+        const std::string doing =
+            w.running() ? "evaluating '" + joinAttrPath(w.attrPath) + "'"
+                        : "starting worker";
+        try {
+            w.proc->throwExited(doing);
+        } catch (WorkerKilled &) {
+            onKilled(idx);
+        }
+    }
+
+    void onKilled(size_t idx) {
+        Worker &w = workers[idx];
+        if (w.phase != Phase::Killed) {
+            nix::logger->log(
+                nix::lvlError,
+                nix::fmt("evaluation worker %d was killed (system out of "
+                         "memory?)",
+                         w.proc->pid()));
+        }
+        if (w.running()) {
+            if (mode == Mode::Solo) {
+                emitError(jobs, w.attrPath,
+                          nix::fmt("evaluation exceeded the memory budget of "
+                                   "%d MiB (workers * max-memory-size) even "
+                                   "when run alone",
+                                   budget));
+            } else {
+                solo.push_back(w.attrPath);
+            }
+        }
+        resetWorker(idx);
+        mode = Mode::Parallel;
+    }
+};
 
 /* Rationale for the separate resolver: see CacheStatusResolver. */
-auto makeCacheStatusResolver(const MyArgs &args, nix::Sync<State> &state_)
+auto makeCacheStatusResolver(const MyArgs &args, nix::Sync<JobMap> &jobs)
     -> std::optional<CacheStatusResolver> {
     if (!args.checkCacheStatus) {
         return std::nullopt;
     }
     return std::optional<CacheStatusResolver>(
         std::in_place, nix_eval_jobs::openStore(args.evalStoreUrl),
-        [&state_](const Response &response) -> void {
-            nlohmann::json jsonResponse = response;
-            auto dumped = jsonResponse.dump();
-            emitResponse(state_, response, std::move(jsonResponse), dumped);
+        nix_eval_jobs::openStore(), [&jobs](const Response &response) -> void {
+            emitResponse(jobs, response);
         });
-}
-
-void collector(nix::Sync<State> &state_, std::condition_variable &wakeup,
-               CacheStatusResolver *cacheStatusResolver) {
-    try {
-        std::unique_ptr<Proc> proc;
-        std::unique_ptr<LineReader> fromReader;
-
-        while (true) {
-            // Claim a job before forking so over-provisioned workers stay idle
-            auto maybeAttrPath = getNextJob(state_, wakeup);
-            if (!maybeAttrPath.has_value()) {
-                if (proc && tryWriteLine(proc->to.get(), "exit") < 0) {
-                    handleBrokenWorkerPipe(*proc, "sending exit");
-                }
-                return;
-            }
-            const auto &attrPath = maybeAttrPath.value();
-
-            // Ensure we have a worker that is ready for a job ("next")
-            while (true) {
-                if (!proc) {
-                    proc = std::make_unique<Proc>(worker);
-                    fromReader =
-                        std::make_unique<LineReader>(proc->from.release());
-                }
-                auto line = checkWorkerStatus(fromReader.get(), proc.get());
-                if (line != "restart") {
-                    break;
-                }
-                proc.reset();
-                fromReader.reset();
-            }
-
-            if (tryWriteLine(proc->to.get(), "do " + attrPath.dump()) < 0) {
-                auto msg = "sending attrPath '" + joinAttrPath(attrPath) + "'";
-                handleBrokenWorkerPipe(*proc, msg);
-            }
-
-            auto newAttrs =
-                processWorkerResponse(fromReader.get(), attrPath, proc.get(),
-                                      state_, cacheStatusResolver);
-
-            updateJobQueue(state_, wakeup, attrPath, newAttrs);
-        }
-    } catch (...) {
-        auto state(state_.lock());
-        state->exc = std::current_exception();
-        wakeup.notify_all();
-    }
 }
 
 void validateIncompatibleFlags(const MyArgs &args) {
@@ -533,21 +553,10 @@ void validateIncompatibleFlags(const MyArgs &args) {
 } // namespace
 
 auto main(int argc, char **argv) -> int {
-    /* We are doing the garbage collection by killing forks */
+    /* We are doing the garbage collection by restarting workers */
     setenv("GC_DONT_GC", "1", 1); // NOLINT(concurrency-mt-unsafe)
 
-    /* Because of an objc quirk[1], calling curl_global_init for the first time
-       after fork() will always result in a crash.
-       Up until now the solution has been to set
-       OBJC_DISABLE_INITIALIZE_FORK_SAFETY for every nix process to ignore that
-       error. Instead of working around that error we address it at the core -
-       by calling curl_global_init here, which should mean curl will already
-       have been initialized by the time we try to do so in a forked process.
-
-       [1]
-       https://github.com/apple-oss-distributions/objc4/blob/01edf1705fbc3ff78a423cd21e03dfc21eb4d780/runtime/objc-initialize.mm#L614-L636
-    */
-    curl_global_init(CURL_GLOBAL_ALL);
+    registerCrashHandler();
 
     auto args = std::span(argv, argc);
 
@@ -603,62 +612,51 @@ auto main(int argc, char **argv) -> int {
             nix::loggerSettings.showTrace.assign(true);
         }
 
-        nix::Sync<State> state_;
+        if (myArgs.runAsWorker) {
+            runWorker();
+            return;
+        }
+
+        WorkerSpawnConfig spawn{.argv = {args.begin(), args.end()}};
+
+        nix::Sync<JobMap> jobs;
 
         /* Pre-initialize the eval store (if specified) before spawning
            workers so that the SQLite database and schema are created
-           exactly once.  Without this, forked workers race to create
+           exactly once.  Without this, workers race to create
            a fresh store and hit SQLite "busy" / "schema is corrupt"
            errors.  See https://github.com/NixOS/nix-eval-jobs/issues/401 */
         if (myArgs.evalStoreUrl.has_value()) {
             nix_eval_jobs::openStore(myArgs.evalStoreUrl);
         }
 
-        /* The fetcher cache is opened lazily on first fetch, so forked
+        /* The fetcher cache is opened lazily on first fetch, so
            workers would otherwise race to create fetcher-cache-v4.sqlite and
            fail with "unable to open database file". Open it once here. */
         nix::fetchSettings.getCache();
 
-        auto cacheStatusResolver = makeCacheStatusResolver(myArgs, state_);
-        auto *cacheStatusResolverPtr =
-            cacheStatusResolver ? &*cacheStatusResolver : nullptr;
-
-        /* Start a collector thread per worker process. */
-        std::vector<Thread> threads;
-        std::condition_variable wakeup;
-        threads.reserve(myArgs.nrWorkers);
-        for (size_t i = 0; i < myArgs.nrWorkers; i++) {
-            threads.emplace_back(
-                [&state_, &wakeup, cacheStatusResolverPtr] -> void {
-                    collector(state_, wakeup, cacheStatusResolverPtr);
-                });
-        }
-
-        for (auto &thread : threads) {
-            thread.join();
-        }
-
-        /* A collector error must surface immediately: rethrowing it
-           here lets the CacheStatusResolver destructor discard the
-           backlog instead of finish() draining it first (which would
-           also mask the eval error with any resolver error). */
-        {
-            auto state(state_.lock());
-            if (state->exc) {
-                std::rethrow_exception(state->exc);
+        if (myArgs.flake) {
+            if (auto lockedAttrs = prefetchFlake(myArgs)) {
+                spawn.config =
+                    nlohmann::json{{"lockedFlake", *lockedAttrs}}.dump();
             }
         }
 
-        /* All eval results are in; wait for outstanding cache-status
-           checks before constituents are aggregated. */
+        auto cacheStatusResolver = makeCacheStatusResolver(myArgs, jobs);
+
+        /* A scheduler error propagates from here so the
+           CacheStatusResolver destructor discards its backlog instead
+           of finish() draining it (and masking the eval error). */
+        Scheduler(myArgs, spawn,
+                  cacheStatusResolver ? &*cacheStatusResolver : nullptr, jobs)
+            .run();
+
         if (cacheStatusResolver) {
             cacheStatusResolver->finish();
         }
 
-        auto state(state_.lock());
-
         if (myArgs.constituents) {
-            handleConstituents(state->jobs, myArgs);
+            handleConstituents(*jobs.lock(), myArgs);
         }
     });
 }

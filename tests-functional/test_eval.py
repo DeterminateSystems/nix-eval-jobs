@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import base64
 import contextlib
 import functools
+import hashlib
 import http.server
 import json
 import os
@@ -65,6 +67,11 @@ def common_test(extra_args: list[str]) -> list[dict[str, Any]]:
         recurse_drv = by_attr["recurse.drvB"]
         assert recurse_drv["name"] == "drvB"
 
+        for r in results:
+            stats = r["stats"]
+            assert stats["wallMs"] >= 0
+            assert stats["allocBytes"] > 0
+
         assert len(list(Path(tempdir).iterdir())) == 4
         return results
 
@@ -110,6 +117,73 @@ def test_input_drvs() -> None:
         assert "inputDrvs" in result
 
 
+def run_plain(expr: str, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(BIN), "--workers", "1", *extra, str(TEST_ROOT / "assets" / expr)],
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_odd_attribute_names_and_cycles() -> None:
+    res = run_plain("odd-names.nix")
+    assert res.returncode == 0, res.stderr
+    results = {r["attr"]: r for r in map(json.loads, res.stdout.splitlines())}
+    assert results[r'"quo\"te"']["name"] == "quote"
+    assert results['""']["name"] == "empty"
+    assert results['"1"']["name"] == "numeric"
+    assert results["cycle.ok"]["name"] == "in-cycle"
+    assert "cycle" in results["cycle.again"]["error"]
+    assert "cycle.again.ok" not in results
+
+
+def test_closed_stdout_aborts() -> None:
+    proc = subprocess.Popen(
+        [str(BIN), "--workers", "1", str(TEST_ROOT / "assets" / "odd-names.nix")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    proc.stdout.close()
+    _, stderr = proc.communicate(timeout=60)
+    assert proc.returncode != 0
+    assert "stdout" in stderr
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [["--workers", "0"], ["--workers", "2x"], ["--workers", "-1"], ["--max-memory-size", "0"]],
+)
+def test_rejects_bad_numeric_flags(flag: list[str]) -> None:
+    res = run_plain("ci.nix", *flag)
+    assert res.returncode != 0
+    assert flag[0] in res.stderr
+
+
+def test_worker_exits_cleanly_when_collector_disappears() -> None:
+    with TemporaryDirectory() as tempdir:
+        cfg = Path(tempdir) / "cfg"
+        cfg.write_text("{}\n")
+        out = Path(tempdir) / "out"
+        with cfg.open() as cfg_fd, out.open("w") as out_fd:
+            res = subprocess.run(
+                [str(BIN), "--worker", str(TEST_ROOT / "assets" / "ci.nix")],
+                stdin=subprocess.DEVNULL,
+                capture_output=False,
+                stderr=subprocess.PIPE,
+                text=True,
+                pass_fds=(3, 4),
+                preexec_fn=lambda: (os.dup2(out_fd.fileno(), 3), os.dup2(cfg_fd.fileno(), 4)),
+                timeout=60,
+                check=False,
+            )
+        assert res.returncode == 0, res.stderr
+        assert out.read_text() == "next\n"
+
+
 def test_eval_error() -> None:
     with TemporaryDirectory() as tempdir:
         cmd = [
@@ -133,6 +207,33 @@ def test_eval_error() -> None:
         attrs = json.loads(res.stdout)
         assert attrs["attr"] == "brokenPackage"
         assert "this is an evaluation error" in attrs["error"]
+
+
+def test_eval_logs_per_attr() -> None:
+    cmd = [
+        str(BIN),
+        "--workers",
+        "1",
+        *COMMON_FLAGS,
+        "--flake",
+        ".#legacyPackages.x86_64-linux.loggingPkgs",
+    ]
+    res = subprocess.run(
+        cmd,
+        cwd=TEST_ROOT.joinpath("assets"),
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    results = {r["attr"]: r for r in map(json.loads, res.stdout.splitlines())}
+    assert results["warns"]["warnings"] == ["first warning", "second warning"]
+    assert "traces" not in results["warns"]
+    assert results["traces"]["traces"] == ["hello from trace"]
+    assert "warnings" not in results["traces"]
+    assert "warnings" not in results["quiet"]
+    assert "traces" not in results["quiet"]
+    assert results["warnThenThrow"]["warnings"] == ["about to fail"]
+    assert "failed" in results["warnThenThrow"]["error"]
 
 
 def test_no_gcroot_dir() -> None:
@@ -748,3 +849,249 @@ def test_fod_with_uncached_input_issue413(tmp_path: Path, scheme: str) -> None:
     jobs = [json.loads(line) for line in res.splitlines() if line]
     fod = next(job for job in jobs if job["attr"] == "fod")
     assert fod["cacheStatus"] == "cached", fod
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "IFD builds the derivation in-process; on macOS Nix still configures "
+        "a sandbox-exec profile even with sandbox=false, which cannot be "
+        "nested inside the functional-tests build sandbox"
+    ),
+)
+def test_ifd_with_separate_eval_store(tmp_path: Path) -> None:
+    """IFD must build in --store, not in a (possibly unbuildable) --eval-store."""
+    env = _hermetic_nix_env(tmp_path)
+    (tmp_path / "ifd.nix").write_text(
+        """
+        let
+          gen = derivation {
+            name = "gen";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            args = [ "-c" "echo '\\"from-ifd\\"' > $out" ];
+          };
+        in {
+          job = derivation {
+            name = import gen;
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            args = [ "-c" ": > $out" ];
+          };
+        }
+        """
+    )
+
+    res = subprocess.run(
+        [
+            str(BIN),
+            "--gc-roots-dir",
+            str(tmp_path / "gc"),
+            *_HERMETIC_NIX_OPTS,
+            "--workers",
+            "1",
+            "--option",
+            "allow-import-from-derivation",
+            "true",
+            "--eval-store",
+            str(tmp_path / "eval"),
+            str(tmp_path / "ifd.nix"),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert res.returncode == 0, res.stderr
+    jobs = [json.loads(line) for line in res.stdout.splitlines() if line]
+    assert len(jobs) == 1
+    assert "error" not in jobs[0], jobs[0]["error"]
+    assert jobs[0]["name"] == "from-ifd"
+    # A local eval store could build itself; tarmac:// or ssh-ng:// cannot.
+    assert list((tmp_path / "store").glob("*-gen")), "IFD was not built in --store"
+
+
+def test_worker_log_format_survives_fork(tmp_path: Path) -> None:
+    env = _hermetic_nix_env(tmp_path)
+    assets = TEST_ROOT.joinpath("assets")
+
+    res = subprocess.run(
+        [
+            str(BIN),
+            "--gc-roots-dir",
+            str(tmp_path / "gc"),
+            *COMMON_FLAGS,
+            "--log-format",
+            "internal-json",
+            "--option",
+            "substituters",
+            "",
+            "--flake",
+            ".#hydraJobs",
+        ],
+        cwd=assets,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    stderr_lines = [line for line in res.stderr.splitlines() if line]
+    assert stderr_lines, "expected nix-eval-jobs to log something on stderr"
+
+    non_json_lines = [line for line in stderr_lines if not line.startswith("@nix ")]
+    assert not non_json_lines, f"stderr contained non-internal-json lines: {non_json_lines}"
+    for line in stderr_lines:
+        json.loads(line[len("@nix ") :])
+
+
+def test_worker_restart_on_last_job_exits_cleanly() -> None:
+    with TemporaryDirectory() as tempdir:
+        res = subprocess.run(
+            [
+                str(BIN),
+                "--gc-roots-dir",
+                tempdir,
+                "--workers",
+                "1",
+                "--max-memory-size",
+                "1",
+                *COMMON_FLAGS,
+                "ci.nix",
+            ],
+            cwd=TEST_ROOT.joinpath("assets"),
+            text=True,
+            capture_output=True,
+        )
+        results = [json.loads(r) for r in res.stdout.split("\n") if r]
+        assert len(results) == 4
+        assert res.returncode == 0, res.stderr
+
+
+def test_fetchers_survive_worker_restart(tmp_path: Path) -> None:
+    """A worker forked after the resolver's first probe (here: forced by
+    --max-memory-size 1) must not inherit an initialised global
+    FileTransfer, or its fetchers hang."""
+    env = _hermetic_nix_env(tmp_path)
+    served = tmp_path / "served"
+    served.mkdir()
+    sources = {}
+    for name in ("one", "two"):
+        data = f"fetched {name}\n".encode()
+        served.joinpath(name).write_bytes(data)
+        sources[name] = base64.b64encode(hashlib.sha256(data).digest()).decode()
+    served.joinpath("nix-cache-info").write_text(
+        f"StoreDir: {env['NIX_STORE_DIR']}\nWantMassQuery: 1\nPriority: 40\n"
+    )
+
+    with _http_server(served) as url:
+        jobs = "\n".join(
+            f"""
+          job-{name} = derivation {{
+            name = "restart-fetch-{name}";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            src = builtins.fetchurl {{
+              url = "{url}/{name}";
+              sha256 = "sha256-{digest}";
+            }};
+          }};"""
+            for name, digest in sources.items()
+        )
+        res = subprocess.run(
+            [
+                str(BIN),
+                "--workers",
+                "1",
+                "--max-memory-size",
+                "1",
+                "--check-cache-status",
+                "--option",
+                "substituters",
+                url,
+                "--option",
+                "require-sigs",
+                "false",
+                "--expr",
+                f"{{ {jobs} }}",
+            ],
+            env=env,
+            text=True,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+    results = [json.loads(line) for line in res.stdout.splitlines() if line]
+    assert len(results) == 2
+
+
+def test_workers_do_not_race_flake_fetch(tmp_path: Path) -> None:
+    """Workers fetching the same flake input concurrently spam "waiting
+    for another Nix process to finish fetching input" (issue #432)."""
+    env = _hermetic_nix_env(tmp_path)
+    repo = tmp_path / "flake"
+    repo.mkdir()
+    jobs = "\n".join(
+        f"""
+        job-{i} = derivation {{
+          name = "race-{i}";
+          system = "x86_64-linux";
+          builder = "/bin/sh";
+          args = [ "-c" "echo {i} > $out" ]; }};"""
+        for i in range(8)
+    )
+    repo.joinpath("flake.nix").write_text(f"{{ outputs = _: {{ hydraJobs = {{ {jobs} }}; }}; }}")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "add", "flake.nix"], cwd=repo, check=True, env=env)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=repo,
+        check=True,
+        env=env,
+    )
+
+    res = subprocess.run(
+        [
+            str(BIN),
+            "--gc-roots-dir",
+            str(tmp_path / "gc"),
+            "--workers",
+            "8",
+            *COMMON_FLAGS,
+            "--flake",
+            f"git+file://{repo}#hydraJobs",
+        ],
+        env=env,
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    assert res.returncode == 0, res.stderr
+    assert len(res.stdout.splitlines()) == 8, res.stderr
+    assert "waiting for another Nix process" not in res.stderr, res.stderr
+
+
+def test_memory_budget_evicts_and_reports_fat_attr() -> None:
+    """A job that cannot fit the budget even alone becomes a per-attr
+    error instead of aborting the whole run. Siblings still succeed."""
+    with TemporaryDirectory() as tempdir:
+        res = subprocess.run(
+            [
+                str(BIN),
+                "--gc-roots-dir",
+                tempdir,
+                "--workers",
+                "2",
+                "--max-memory-size",
+                "150",
+                *COMMON_FLAGS,
+                "memory-hog.nix",
+            ],
+            cwd=TEST_ROOT.joinpath("assets"),
+            text=True,
+            capture_output=True,
+        )
+        assert res.returncode == 0, res.stderr
+        results = {r["attr"]: r for r in map(json.loads, res.stdout.splitlines()) if r}
+        assert "drvPath" in results["small"], results
+        assert "memory budget" in results["fat"].get("error", ""), results
+        assert "killing worker" in res.stderr
