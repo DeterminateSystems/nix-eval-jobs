@@ -18,6 +18,7 @@ jobs:
       contents: "read"
     with:
       visibility: public
+      allow-fork: DeterminateSystems/nix-eval-jobs
       runner-map: |
         {
           "aarch64-darwin": "namespace-profile-mac-m2-12c28g",
