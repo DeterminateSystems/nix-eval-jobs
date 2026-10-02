@@ -15,7 +15,7 @@ let
       super = import (nix + "/packaging/dependencies.nix") {
         inherit pkgs;
         inherit (pkgs) stdenv;
-        inputs = { };
+        inherit (nix) inputs;
       } scope;
     in
     super
