@@ -84,12 +84,12 @@
         "nixpkgs-regression": "nixpkgs-regression"
       },
       "locked": {
-        "lastModified": 1792969108,
-        "narHash": "sha256-pDSWr7TQd9V9thIxlsqHzVGkuymDkckQpgaXLf7EuJ0=",
-        "rev": "240bbbcb10d3fc4bce957fafc1000b85ffb004d0",
-        "revCount": 27820,
+        "lastModified": 1793808558,
+        "narHash": "sha256-QY69Nw0WhXSvT2n2ldI5gt0h4ofbAVoi7EYGJGyNLl0=",
+        "rev": "f43bee4f45c2d42e7d1f4e37908ec5c7bb0fdba1",
+        "revCount": 27900,
         "type": "tarball",
-        "url": "https://api.flakehub.com/f/pinned/DeterminateSystems/nix-src/3.24.1/01a17596-6fbb-7a40-86cd-21b4eb251403/source.tar.gz"
+        "url": "https://api.flakehub.com/f/pinned/DeterminateSystems/nix-src/3.24.2/01a1a784-2356-7ff3-a013-b47d4fd7ed90/source.tar.gz"
       },
       "original": {
         "type": "tarball",
